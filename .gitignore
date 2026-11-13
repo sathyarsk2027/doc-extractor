@@ -1,0 +1,29 @@
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.pytest_cache/
+
+# Storage & uploads
+backend/storage/
+storage/
+
+# Node / Frontend
+node_modules/
+dist/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Samples (ignore everything inside samples except README.md)
+samples/*
+!samples/README.md
+
