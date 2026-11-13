@@ -14,7 +14,15 @@ load_dotenv(dotenv_path=ENV_PATH)
 class Settings(BaseModel):
     """Application settings loaded from environment with typed defaults."""
 
-    gemini_api_key: str = os.getenv("GEMINI_API_KEY", "your-key-here")
+    # Groq LLM settings
+    groq_api_key: str = os.getenv("GROQ_API_KEY", "your-key-here")
+    groq_model: str = os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b")
+    groq_timeout_seconds: int = int(os.getenv("GROQ_TIMEOUT_SECONDS", "60"))
+    groq_max_retries: int = int(os.getenv("GROQ_MAX_RETRIES", "2"))
+    groq_max_output_tokens: int = int(os.getenv("GROQ_MAX_OUTPUT_TOKENS", "1500"))
+    extraction_max_pages: int = int(os.getenv("EXTRACTION_MAX_PAGES", "2"))
+
+    # General app settings
     frontend_origin: str = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
     max_file_mb: int = int(os.getenv("MAX_FILE_MB", "10"))
     max_pdf_pages: int = int(os.getenv("MAX_PDF_PAGES", "5"))
@@ -30,6 +38,14 @@ class Settings(BaseModel):
         if not p.is_absolute():
             p = BACKEND_DIR / p
         return p
+
+    @property
+    def groq_api_key_valid(self) -> bool:
+        """Check that the Groq API key is set and not a placeholder."""
+        return bool(
+            self.groq_api_key
+            and self.groq_api_key not in ("your-key-here", "")
+        )
 
 
 settings = Settings()

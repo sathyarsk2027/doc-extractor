@@ -73,3 +73,41 @@
   - `pytest -v` passed all 16 tests across upload and preprocessing suites in 1.61s.
   - Uploaded 3 real files (`invoice.pdf`, `phone_photo.jpg`, `store_receipt.png`) against live backend server. Previews fetched with HTTP 200 and verified image headers.
   - Confirmed `.env` and `storage/` are completely untracked and excluded in `.gitignore`.
+
+## Step 3.1: Config and Dependencies
+- **What changed**: Installed `groq==1.7.0`, uninstalled `google-genai`, re-froze `requirements.txt`. Updated `.env.example` and `.env` with Groq config keys (`GROQ_API_KEY`, `GROQ_MODEL`, `GROQ_TIMEOUT_SECONDS`, `GROQ_MAX_RETRIES`, `GROQ_MAX_OUTPUT_TOKENS`, `EXTRACTION_MAX_PAGES`). Updated `config.py` to load all new settings with defaults and added `groq_api_key_valid` property that rejects missing/placeholder keys.
+- **Verification result**: `pip freeze` confirms `groq==1.7.0` present and `google-genai` absent. Config loads cleanly: `groq_api_key_valid=False` with placeholder, model/timeout/max_pages defaults correct.
+
+## Step 3.2: Schemas
+- **What changed**: Added `LineItem`, `InvoiceData`, `ExtractionMeta` models to `app/schemas.py`. Added `extraction_meta`, `extraction_error`, `flags`, and `needs_review` fields to `ExtractResponse`.
+- **Verification result**: All models import and serialize correctly. `InvoiceData` with nested `LineItem` round-trips through `model_dump_json()`.
+
+## Steps 3.3–3.6: Extractor Interface, Page Selection, Prompt/Call, Error Handling
+- **What changed**: Created abstract `Extractor` base class and `extract_document()` orchestrator in `app/services/extractor.py`. Implemented `GroqExtractor` in `app/services/groq_extractor.py` with: extraction prompt constant, `reasoning_effort="none"` + `response_format={"type":"json_object"}` + `temperature=0`, JSON parse with code-fence stripping, one repair retry on parse failure, module-level `threading.Lock` for serialization, 429 retry with `retry-after` header (cap 65s, default 20s), and mapped error types (`AuthenticationError`→LLM_AUTH_ERROR, `RateLimitError`→RATE_LIMITED, timeout/5xx→LLM_UNAVAILABLE). Page selection: all if ≤max_pages, else first+last, never >3.
+- **Verification result**: All modules import cleanly. `get_extractor()` correctly raises `LLM_AUTH_ERROR` when key is placeholder.
+
+## Step 3.7: Wire into API Route
+- **What changed**: Rewrote `POST /api/extract` route as sync `def` (not `async def`) so blocking Groq SDK call runs in FastAPI's thread pool. Route now: reads file bytes synchronously, validates, preprocesses, then attempts LLM extraction. If extraction fails with `AppError`, returns HTTP 200 with `extraction: null` and `extraction_error: {code, message}` alongside previews. If extraction succeeds, returns `extraction` dict and `extraction_meta`.
+- **Verification result**: All 16 existing tests pass (8 upload + 8 preprocessing). Manual test with placeholder key shows `extraction_error: {code: "LLM_AUTH_ERROR", ...}` with HTTP 200 and previews intact.
+
+## Step 3.8: Manual Try Script
+- **What changed**: Created `backend/scripts/try_extract.py` that takes a file path, runs the full pipeline (detect MIME → save → preprocess → extract), and prints extracted JSON, token counts, latency, and pages sent. Cleans up temp files afterward.
+- **Verification result**: Script imports and runs correctly (with placeholder key it shows the expected `LLM_AUTH_ERROR`).
+
+## Step 3.9: Tests (all mocked)
+- **What changed**: Created `tests/test_extraction.py` with 20 tests covering: JSON parsing helpers (valid, fenced, invalid, extra fields), page selection (1/2/5 pages), GroqExtractor with mocked client (valid response, fenced response, repair on first failure, double failure → LLM_BAD_OUTPUT, 429→retry→success, 429 exhausted→RATE_LIMITED, auth error→LLM_AUTH_ERROR), placeholder API key check, and route integration (returns 200 with extraction_error while preserving previews).
+- **Verification result**: `pytest tests/ -q` → **36 passed in 0.82s** (8 upload + 8 preprocessing + 20 extraction). Zero real API calls used.
+
+## Step 3.10: Frontend Smoke Update
+- **What changed**: Updated `App.jsx` to show extracted JSON in a `<pre>` block, extraction_meta (model, latency, tokens, pages, repaired), extraction_error in error style, validation flags with severity colors, and a needs_review badge. Updated `App.css` with dark-mode-safe colors (explicit light text for h1/h2/h3/p), styled JSON block, flag error/warning colors, and light mode overrides.
+- **Verification result**: `npm run build` → 32 modules transformed, built in 780ms, zero warnings.
+
+## Phase 3 Verification: Real Groq API Extraction
+- **What changed**: Added `guard_against_real_api_calls` autouse fixture to `conftest.py` so automated tests strictly mock LLM extraction and cannot consume live quota. Ran live extraction via `try_extract.py` and via web frontend dev proxy.
+- **Verification result**:
+  - `pytest -q`: 36 passed in 2.17s (all mocked, zero real API calls used).
+  - Real call 1: `invoice.pdf` (text PDF, 2 pages) extracted vendor `ACME SUPPLIES CORP`, invoice `INV-2026-9041`, date `2026-11-12`, currency `USD`, 5 line items, subtotal $650.00, tax $52.00, total $702.00. Input tokens: 3956, output tokens: 337, latency: 5245ms.
+  - Real call 2: `phone_photo.jpg` (plain sample photo) extracted all fields as null and empty line items per prompt rules. Input tokens: 2162, output tokens: 60, latency: 3884ms.
+  - Real call 3: Web proxy upload of `sample_invoice.pdf` via Vite proxy (`http://127.0.0.1:5173/api/extract`) returned HTTP 200 with previews, extracted vendor `ACME Supplies Inc.`, invoice `1024`, total $142.50. Input tokens: 2162, output tokens: 75, latency: 1709ms.
+  - Total real API calls used: 3 of 5.
+  - Git status: strictly clean, no secrets leaked or committed.

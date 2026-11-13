@@ -3,15 +3,23 @@
   margin: 2rem auto;
   padding: 1.5rem;
   font-family: system-ui, -apple-system, sans-serif;
-  color: #222;
 }
 
 h1 {
   margin-bottom: 0.25rem;
+  color: #f0f0f0;
+}
+
+h2, h3 {
+  color: #e0e0e0;
+}
+
+p {
+  color: #ccc;
 }
 
 .subtitle {
-  color: #666;
+  color: #999;
   margin-bottom: 1.5rem;
 }
 
@@ -21,8 +29,9 @@ h1 {
   align-items: center;
   margin-bottom: 1.5rem;
   padding: 1rem;
-  background: #f4f4f4;
+  background: #333;
   border-radius: 6px;
+  color: #e0e0e0;
 }
 
 button {
@@ -36,15 +45,15 @@ button {
 }
 
 button:disabled {
-  background: #999;
+  background: #555;
   cursor: not-allowed;
 }
 
 .error-box {
   padding: 0.75rem 1rem;
-  background: #ffebe9;
-  border: 1px solid #ff8182;
-  color: #cf222e;
+  background: #3d1417;
+  border: 1px solid #a93226;
+  color: #f5a6a0;
   border-radius: 6px;
   margin-bottom: 1.5rem;
 }
@@ -61,23 +70,95 @@ button:disabled {
 }
 
 .preview-card {
-  border: 1px solid #ddd;
+  border: 1px solid #444;
   border-radius: 6px;
   padding: 0.75rem;
-  background: #fafafa;
+  background: #2a2a2a;
 }
 
 .page-label {
   display: block;
   font-size: 0.875rem;
-  color: #555;
+  color: #aaa;
   margin-bottom: 0.5rem;
 }
 
 .preview-image {
   width: 100%;
   height: auto;
-  border: 1px solid #eee;
+  border: 1px solid #555;
   border-radius: 4px;
   background: #fff;
+}
+
+/* Extraction JSON block */
+.extraction-section {
+  margin-top: 1.5rem;
+}
+
+.json-block {
+  background: #1e1e1e;
+  color: #d4d4d4;
+  border: 1px solid #444;
+  border-radius: 6px;
+  padding: 1rem;
+  overflow-x: auto;
+  font-size: 0.85rem;
+  line-height: 1.4;
+  max-height: 500px;
+  overflow-y: auto;
+}
+
+.meta-info {
+  font-size: 0.8rem;
+  color: #888;
+  margin-top: 0.5rem;
+}
+
+/* Validation flags */
+.flags-section {
+  margin-top: 1.5rem;
+}
+
+.flags-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.flags-list li {
+  padding: 0.5rem 0.75rem;
+  border-radius: 4px;
+  margin-bottom: 0.5rem;
+  font-size: 0.9rem;
+}
+
+.flag-error {
+  background: #3d1417;
+  border-left: 4px solid #cf222e;
+  color: #f5a6a0;
+}
+
+.flag-warning {
+  background: #3d3017;
+  border-left: 4px solid #d29922;
+  color: #f5d580;
+}
+
+/* Light mode overrides */
+@media (prefers-color-scheme: light) {
+  h1, h2, h3 { color: #222; }
+  p { color: #444; }
+  .subtitle { color: #666; }
+  .upload-form { background: #f4f4f4; color: #222; }
+  .error-box { background: #ffebe9; border-color: #ff8182; color: #cf222e; }
+  .preview-card { border-color: #ddd; background: #fafafa; }
+  .page-label { color: #555; }
+  .preview-image { border-color: #eee; }
+  .json-block { background: #f6f8fa; color: #24292e; border-color: #d0d7de; }
+  .meta-info { color: #666; }
+  .flag-error { background: #ffebe9; border-left-color: #cf222e; color: #cf222e; }
+  .flag-warning { background: #fff8e1; border-left-color: #d29922; color: #9a6700; }
+  button { background: #0066cc; }
+  button:disabled { background: #999; }
 }
