@@ -5,6 +5,8 @@ import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
 
+import pymupdf
+
 from app.config import settings
 from app.errors import AppError
 from app.schemas import InvoiceData, ExtractionMeta
@@ -17,11 +19,18 @@ class Extractor(ABC):
     """Abstract base class for LLM-based document extraction."""
 
     @abstractmethod
-    def extract(self, page_images: list[bytes]) -> tuple[InvoiceData, ExtractionMeta]:
-        """Extract structured invoice data from page images.
+    def extract(
+        self,
+        page_images: list[bytes],
+        text_content: str | None = None,
+        source: str = "image",
+    ) -> tuple[InvoiceData, ExtractionMeta]:
+        """Extract structured invoice data from page images or extracted text.
 
         Args:
             page_images: List of PNG image bytes for selected pages.
+            text_content: Optional extracted text layer from digital PDF.
+            source: Source modality ("text" or "image").
 
         Returns:
             Tuple of (extracted data, extraction metadata).
@@ -77,6 +86,27 @@ def select_pages(doc_dir: Path, page_count: int) -> tuple[list[bytes], list[int]
     return images, page_numbers
 
 
+def extract_pdf_text_for_pages(doc_dir: Path, page_numbers: list[int]) -> str | None:
+    """Extract embedded digital text from original.pdf for selected pages."""
+    pdf_path = doc_dir / "original.pdf"
+    if not pdf_path.is_file():
+        return None
+
+    try:
+        doc = pymupdf.open(str(pdf_path))
+        text_parts = []
+        for pn in page_numbers:
+            if pn <= len(doc):
+                page_text = doc[pn - 1].get_text("text").strip()
+                if page_text:
+                    text_parts.append(f"--- PAGE {pn} ---\n{page_text}")
+        doc.close()
+        return "\n\n".join(text_parts).strip() if text_parts else None
+    except Exception as exc:
+        logger.warning("Failed to extract digital text from PDF: %s", exc)
+        return None
+
+
 def images_to_base64_urls(images: list[bytes]) -> list[str]:
     """Convert PNG image bytes to base64 data URLs."""
     urls = []
@@ -88,6 +118,9 @@ def images_to_base64_urls(images: list[bytes]) -> list[str]:
 
 def extract_document(document_id: str) -> tuple[InvoiceData, ExtractionMeta]:
     """Run the full extraction pipeline for a preprocessed document.
+
+    Orchestrates page selection, text-first mode determination, LLM extraction,
+    and metadata recording.
 
     Args:
         document_id: UUID of the already-preprocessed document.
@@ -128,15 +161,35 @@ def extract_document(document_id: str) -> tuple[InvoiceData, ExtractionMeta]:
             status_code=500,
         )
 
+    # Determine extraction mode: text-first vs image
+    pdf_text = extract_pdf_text_for_pages(doc_dir, page_numbers)
+    text_char_count = len(pdf_text) if pdf_text else 0
+
+    mode = settings.extraction_mode.lower()
+    if mode == "text" and text_char_count > 0:
+        source = "text"
+    elif mode == "image":
+        source = "image"
+    else:  # "auto"
+        # If PDF has significant text layer (>= 50 chars), prefer text mode
+        source = "text" if text_char_count >= 50 else "image"
+
     logger.info(
-        "Extracting document %s: %d of %d pages selected (pages %s)",
+        "Extracting document %s: %d of %d pages selected (pages %s, source=%s, text_chars=%d)",
         document_id,
         len(images),
         page_count,
         page_numbers,
+        source,
+        text_char_count,
     )
 
-    invoice_data, meta = extractor.extract(images)
+    invoice_data, meta = extractor.extract(
+        page_images=images,
+        text_content=pdf_text if source == "text" else None,
+        source=source,
+    )
     meta.pages_sent = page_numbers
+    meta.source = source
 
     return invoice_data, meta

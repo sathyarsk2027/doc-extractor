@@ -20,7 +20,9 @@ class Settings(BaseModel):
     groq_timeout_seconds: int = int(os.getenv("GROQ_TIMEOUT_SECONDS", "60"))
     groq_max_retries: int = int(os.getenv("GROQ_MAX_RETRIES", "2"))
     groq_max_output_tokens: int = int(os.getenv("GROQ_MAX_OUTPUT_TOKENS", "1500"))
+    groq_seed: int = int(os.getenv("GROQ_SEED", "42"))
     extraction_max_pages: int = int(os.getenv("EXTRACTION_MAX_PAGES", "2"))
+    extraction_mode: str = os.getenv("EXTRACTION_MODE", "auto")  # "auto", "text", "image"
 
     # General app settings
     frontend_origin: str = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")

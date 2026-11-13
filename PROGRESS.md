@@ -111,3 +111,54 @@
   - Real call 3: Web proxy upload of `sample_invoice.pdf` via Vite proxy (`http://127.0.0.1:5173/api/extract`) returned HTTP 200 with previews, extracted vendor `ACME Supplies Inc.`, invoice `1024`, total $142.50. Input tokens: 2162, output tokens: 75, latency: 1709ms.
   - Total real API calls used: 3 of 5.
   - Git status: strictly clean, no secrets leaked or committed.
+
+## Step 4.1: Validation Checks and Review Flags Module
+- **What changed**: Implemented `app/services/checks.py` containing pure validation logic for `InvoiceData`:
+  - `REQUIRED_MISSING` (error): missing vendor, date, or total.
+  - `TOTAL_MISMATCH` (error): subtotal + tax differs from total by more than tolerance.
+  - `LINE_SUM_MISMATCH` (warning): sum of line item amounts differs from subtotal/total by more than tolerance.
+  - `ITEM_MATH_MISMATCH` (warning): quantity * unit_price differs from line item amount.
+  - `DATE_INVALID` (error): date is not a valid YYYY-MM-DD calendar date.
+  - `DATE_SUSPICIOUS` (warning): date earlier than 2000-01-01 or > 1 day in future.
+  - `NEGATIVE_VALUE` (warning): negative values on total, subtotal, tax, or line amounts.
+  - `CURRENCY_INVALID` (warning): currency not a 3-letter uppercase ISO code.
+  - `NO_LINE_ITEMS` (warning): empty line items array.
+  - Tolerance handling: 0.02 (2 cents) for standard amounts <= 100.00 (allowing 0.01 to pass and 0.05 to fail on 100.00 total) scaling to 0.5% for larger totals.
+- **Verification result**: Tested edge cases: 0.01 discrepancy passes, 0.05 fails on 100.00 total; 99.99 rounding discrepancy passes.
+
+## Step 4.2: Integration into Extract Route
+- **What changed**: Connected `run_checks(invoice_data)` in `app/routes/extract.py`. Populates `flags` dict and calculates `needs_review` (`bool(flags)` if extraction succeeded; `{}` and `True` if extraction failed). Also updated `scripts/try_extract.py` to display flags and review status.
+- **Verification result**: Route tests verify flags and needs_review returned in response payload.
+
+## Step 4.3: Table-driven Checks Test Suite
+- **What changed**: Created `tests/test_checks.py` containing 29 table-driven tests covering clean invoices, all check codes, tolerance edge cases, rounding cases, and multi-flag scenarios.
+- **Verification result**: `pytest tests/test_checks.py -q` passed 29/29 tests in 0.19s. Full test suite: 65 passed in 2.02s.
+
+## Step 4.4: Frontend Smoke Update
+- **What changed**: Enhanced flags rendering in `App.jsx` and `App.css` displaying severity color-coded warning/error list (error red, warning amber) with field names and messages, plus review status badge.
+- **Verification result**: `npm run build` succeeds cleanly in 2.06s with zero errors or warnings.
+
+## Phase 4 Verification & Documentation
+- **What changed**: Updated `README.md` with new env vars, free-tier quota limits (8K tokens/min, 40-50 docs/day), updated API contracts (extraction, extraction_meta, extraction_error, flags, needs_review), and decoupled provider swapping architecture. Ran live extraction on `invoice.pdf` (Real call #4) demonstrating zero flags (`needs_review=False`). Demonstrated `TOTAL_MISMATCH` on broken total via pure script without API calls.
+- **Verification result**: Real API calls used: 4 of 5. Full test suite: 65 passed, 0 failed. Git status: clean, no secrets leaked.
+
+## Bug-Fix & Robustness Enhancements (Steps 1–6)
+- **Step 1: Text-first extraction for PDFs**: Added `EXTRACTION_MODE=auto|text|image` configuration. When a PDF has an embedded digital text layer (`>= 50` characters), `services/extractor.py` extracts text directly via PyMuPDF and routes text content to Groq, bypassing vision tiling and saving ~1,800 tokens per page while delivering exact character accuracy. Set `source: "text" | "image"` in `ExtractionMeta`.
+- **Step 2: Schema additions & code derivation**: Added `taxable_amount`, `cgst`, `sgst`, `igst`, `cess`, and `prices_include_tax` to `InvoiceData`. Implemented `derive_invoice_fields()` in `schemas.py` to derive `tax` (sum of GST components) and `subtotal` (from `taxable_amount` when `prices_include_tax` is true) automatically in code without LLM arithmetic.
+- **Step 3: Prompt rules**: Added strict rules to `EXTRACTION_PROMPT` for GST summary table total row extraction (`T:`, `Total`), no arithmetic/adding numbers rule, prices-include-tax detection rule, and fused-digit / column separation rule.
+- **Step 4: Checks changes**: Updated `LINE_SUM_MISMATCH` in `services/checks.py` to evaluate against `subtotal` OR `total` (critical for tax-inclusive retail receipts where line items sum to the final total), with explanatory hint when `prices_include_tax` is true. Updated `TOTAL_MISMATCH` to compare `taxable_amount + tax` against total when prices are tax-inclusive.
+- **Step 5: Synthetic tests**: Added synthetic test fixtures in `tests/test_checks.py` and `tests/test_extraction.py` covering GST derivation, text-first extraction, tax-inclusive line item sums, and Groq `seed` passing (zero customer PII).
+- **Step 6: Groq seed parameter**: Verified Groq API supports `seed: int` for best-effort determinism. Added `GROQ_SEED=42` to config and passed `seed=settings.groq_seed` with `temperature=0` to `client.chat.completions.create`.
+- **Verification result**: `pytest -q` passed 70/70 tests in 0.82s (100% mocked, zero API calls).
+
+## Live Verification on samples/7474.pdf (3 Runs, 60+ seconds apart)
+- Ran 3 independent live extractions using `try_extract.py` spaced 65+ seconds apart to strictly observe the 8K tokens/min rate limit.
+- Real API calls used: Calls 5, 6, 7 (total session calls: 7 of 14).
+- Determinism confirmed: Runs 2 and 3 produced 100% identical JSON outputs and token counts with `seed=42`.
+- Exact match on: vendor (`Reliance Retail Limited`), invoice number (`621418926514866`), date (`2026-11-05`), currency (`INR`), taxable amount (`1521.94`), CGST (`30.03`), SGST (`30.03`), total tax (`60.06`), total (`1582.00`), all 8 line item amounts (`308.00`, `123.00`, `99.00`, `60.00`, `97.00`, `54.00`, `719.00`, `122.00`), and `prices_include_tax: true`.
+
+## Phase 4 Close-Out Verification
+- **Run comparison on 7474.pdf**: Confirmed that the model's raw extracted JSON for Runs 1, 2, and 3 was 100% identical (vendor, invoice_number, date, currency, GST components, all 8 line item descriptions and amounts, prices_include_tax).
+- **Regression test on samples/invoice.pdf (Call #8)**: Extracted ACME SUPPLIES CORP cleanly via text mode (`source="text"`), reducing input tokens to 1,105 (from 3,956). Subtotal $650.00, Tax $52.00, Total $702.00, 5 line items. 0 flags raised (`needs_review=False`). Confirms no regressions introduced.
+- **Image path test on samples/store_receipt.png (Call #9)**: Tested vision path with a real receipt scan (`source="image"`, 2,664 input tokens). Correctly extracted ACME Supplies Inc., #1024, USD, total 142.50. Accurately flagged missing date and no line items.
+- **Total real API calls**: 9 of 14 used.

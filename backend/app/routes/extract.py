@@ -8,6 +8,7 @@ from app.errors import AppError
 from app.schemas import ExtractResponse, PagePreview
 from app.services.validation import validate_upload
 from app.services.extractor import extract_document
+from app.services.checks import run_checks
 from app.services.storage import (
     save_original,
     delete_document,
@@ -88,20 +89,29 @@ def extract_endpoint(file: UploadFile = File(...)) -> ExtractResponse:
     extraction = None
     extraction_meta = None
     extraction_error = None
+    flags: dict = {}
+    needs_review = True
 
     try:
         invoice_data, meta = extract_document(document_id)
         extraction = invoice_data.model_dump()
         extraction_meta = meta.model_dump()
+        # Run validation checks on extracted structured data
+        flags = run_checks(invoice_data)
+        needs_review = bool(flags)
     except AppError as exc:
         logger.warning("Extraction failed for %s: [%s] %s", document_id, exc.code, exc.message)
         extraction_error = {"code": exc.code, "message": exc.message}
+        flags = {}
+        needs_review = True
     except Exception as exc:
         logger.exception("Unexpected extraction error for %s", document_id)
         extraction_error = {
             "code": "INTERNAL_ERROR",
             "message": "An unexpected error occurred during extraction.",
         }
+        flags = {}
+        needs_review = True
 
     return ExtractResponse(
         document_id=document_id,
@@ -112,7 +122,7 @@ def extract_endpoint(file: UploadFile = File(...)) -> ExtractResponse:
         extraction=extraction,
         extraction_meta=extraction_meta,
         extraction_error=extraction_error,
-        flags={},
-        needs_review=True,
+        flags=flags,
+        needs_review=needs_review,
         message="Extraction complete." if extraction else "Preprocessing complete. Extraction failed.",
     )

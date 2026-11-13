@@ -337,3 +337,78 @@ class TestRouteExtractionError:
         assert len(data["pages"]) == 1
         assert data["pages"][0]["preview_url"].endswith("1.png")
 
+
+
+# ---------------------------------------------------------------------------
+# Tests: GST derivation and text-first extraction
+# ---------------------------------------------------------------------------
+
+class TestGstDerivationAndTextMode:
+    def test_derive_invoice_fields_from_gst(self):
+        """Derive total tax from cgst + sgst and subtotal from taxable_amount."""
+        from app.schemas import derive_invoice_fields
+
+        invoice = InvoiceData(
+            vendor="Retail Supermarket Ltd",
+            date="2026-11-05",
+            currency="INR",
+            total=1582.0,
+            taxable_amount=1521.94,
+            cgst=30.03,
+            sgst=30.03,
+            tax=None,       # Missing, should be derived
+            subtotal=None,  # Missing, should be derived
+            prices_include_tax=True,
+        )
+        derived = derive_invoice_fields(invoice)
+        assert derived.tax == 60.06
+        assert derived.subtotal == 1521.94
+        assert derived.total == 1582.0
+
+    @patch("app.services.groq_extractor.Groq")
+    def test_text_first_extraction_mode(self, MockGroq):
+        """When source='text', text prompt is constructed and meta.source='text'."""
+        mock_client = MagicMock()
+        MockGroq.return_value = mock_client
+        mock_client.chat.completions.create.return_value = _make_mock_response(VALID_JSON)
+
+        extractor = GroqExtractor()
+        doc_text = "Sample Digital PDF Text Content Invoice #123"
+        invoice, meta = extractor.extract(
+            page_images=[_make_png_bytes()],
+            text_content=doc_text,
+            source="text",
+        )
+
+        assert meta.source == "text"
+        call_kwargs = mock_client.chat.completions.create.call_args[1]
+        assert call_kwargs["seed"] == settings.groq_seed
+        messages = call_kwargs["messages"]
+        user_content = messages[0]["content"]
+        # Verify no image_url block was sent
+        for block in user_content:
+            assert block["type"] != "image_url"
+            if block["type"] == "text":
+                assert "DOCUMENT TEXT" in block["text"]
+                assert doc_text in block["text"]
+
+    @patch("app.services.groq_extractor.Groq")
+    def test_image_extraction_mode(self, MockGroq):
+        """When source='image', images are converted to data URLs and meta.source='image'."""
+        mock_client = MagicMock()
+        MockGroq.return_value = mock_client
+        mock_client.chat.completions.create.return_value = _make_mock_response(VALID_JSON)
+
+        extractor = GroqExtractor()
+        invoice, meta = extractor.extract(
+            page_images=[_make_png_bytes()],
+            source="image",
+        )
+
+        assert meta.source == "image"
+        call_kwargs = mock_client.chat.completions.create.call_args[1]
+        assert call_kwargs["seed"] == settings.groq_seed
+        messages = call_kwargs["messages"]
+        user_content = messages[0]["content"]
+        has_image = any(b["type"] == "image_url" for b in user_content)
+        assert has_image is True

@@ -10,7 +10,7 @@ from groq import Groq, RateLimitError, AuthenticationError, APITimeoutError, API
 
 from app.config import settings
 from app.errors import AppError
-from app.schemas import InvoiceData, ExtractionMeta
+from app.schemas import InvoiceData, ExtractionMeta, derive_invoice_fields
 from app.services.extractor import Extractor, images_to_base64_urls
 
 logger = logging.getLogger("doc_extractor")
@@ -21,7 +21,7 @@ _groq_lock = threading.Lock()
 EXTRACTION_PROMPT = """\
 You are a precise data-extraction assistant for invoices and receipts.
 
-Examine the provided document image(s) carefully and extract all visible information into a single JSON object with exactly this structure:
+Examine the provided document carefully and extract all visible information into a single JSON object with exactly this structure:
 
 {
   "vendor": string or null,
@@ -36,20 +36,38 @@ Examine the provided document image(s) carefully and extract all visible informa
       "amount": number or null
     }
   ],
+  "taxable_amount": number or null,
+  "cgst": number or null,
+  "sgst": number or null,
+  "igst": number or null,
+  "cess": number or null,
   "subtotal": number or null,
   "tax": number or null,
-  "total": number or null
+  "total": number or null,
+  "prices_include_tax": boolean or null
 }
 
-Rules:
-- Output ONLY one JSON object. No markdown, no commentary, no explanation.
-- Use null for any field whose value is not clearly visible in the document. Never guess or calculate missing values.
-- "date" must be in YYYY-MM-DD format (ISO 8601).
-- Numbers must be plain numbers without currency symbols, thousands separators, or formatting. Example: 1234.56 not "$1,234.56".
-- "currency" must be a 3-letter ISO 4217 code (e.g. INR, USD, EUR, GBP).
-- Copy text exactly as printed on the document (vendor name, descriptions, invoice number).
-- If multiple pages are provided, they belong to the same document — combine all information into one JSON object.
-- "line_items" should list every individual item/service line visible. Use an empty array [] if none are visible.
+Strict Rules:
+1. Output ONLY one valid JSON object. No markdown fences, no commentary, no explanation.
+2. Use null for any field whose value is not clearly visible in the document.
+3. NEVER calculate, add, or sum numbers yourself. Extract numbers exactly as printed on the document. If a total tax amount is not printed as a single pre-calculated number, extract cgst, sgst, igst, and cess individually and leave "tax" as null (application code will derive the sum).
+4. Date format: "date" must be in YYYY-MM-DD format (ISO 8601). If the printed date is e.g. "05-11-2026", convert it to "2026-11-05".
+5. Numbers: Plain numbers only without currency symbols or thousands separators. Example: 1582.00 not "Rs. 1,582.00".
+6. Currency: 3-letter ISO 4217 code (e.g. INR, USD, EUR, GBP).
+7. Copy text (vendor name, item descriptions, invoice number) exactly as printed on the document.
+8. GST / Tax Summary Table Rule:
+   - When a GST or tax breakdown table is present (e.g. columns for Taxable, CGST, SGST, IGST, CESS), extract amounts from the TOTAL row (often labelled with "T:", "Total", or at the bottom line).
+   - "taxable_amount": total taxable value from the summary total row.
+   - "cgst": total CGST amount from the summary total row.
+   - "sgst": total SGST amount from the summary total row.
+   - "igst": total IGST amount from the summary total row.
+   - "cess": total CESS amount from the summary total row.
+   - Do NOT extract individual tax rate sub-rows (e.g. 2.5%, 9%) as invoice-level totals.
+9. Prices-Include-Tax Rule:
+   - If the document states that item prices include taxes (e.g. "inclusive of GST", "prices include tax", "AMT INCL. OF APPLICABLE TAXES", "MRP incl."), or if line item amounts sum to the invoice total rather than the taxable amount, set "prices_include_tax": true.
+10. Fused-Digit / Column Separation Rule:
+    - Watch out for fused column digits or touch-aligned text (e.g. "1 590.00" where "1" is a rate/serial number and "590.00" is the monetary amount; or "Item: 8 QTY : 9 1582.00" where "1582.00" is the total sales value). Separate line item numbers, quantities, and rates from actual monetary amounts.
+11. Multi-page: Combine all pages into one single complete JSON object.
 """
 
 REPAIR_PROMPT_TEMPLATE = """\
@@ -63,7 +81,6 @@ Please output ONLY the corrected JSON object with the same schema. No explanatio
 def _strip_code_fences(text: str) -> str:
     """Remove accidental markdown code fences from LLM output."""
     text = text.strip()
-    # Remove ```json ... ``` or ``` ... ```
     match = re.match(r"^```(?:json)?\s*\n?(.*?)\n?\s*```$", text, re.DOTALL)
     if match:
         return match.group(1).strip()
@@ -85,8 +102,8 @@ def _parse_invoice_json(raw_text: str) -> InvoiceData:
     return InvoiceData.model_validate(data)
 
 
-def _build_user_content(base64_urls: list[str]) -> list[dict]:
-    """Build the multimodal user message content with text + images."""
+def _build_image_user_content(base64_urls: list[str]) -> list[dict]:
+    """Build the multimodal user message content with text instructions + image URLs."""
     content: list[dict] = [{"type": "text", "text": EXTRACTION_PROMPT}]
     for url in base64_urls:
         content.append({
@@ -96,8 +113,19 @@ def _build_user_content(base64_urls: list[str]) -> list[dict]:
     return content
 
 
+def _build_text_user_content(text_content: str) -> list[dict]:
+    """Build the text-only user message content with text instructions + document text."""
+    prompt_with_text = (
+        f"{EXTRACTION_PROMPT}\n\n"
+        f"--- DOCUMENT TEXT ---\n"
+        f"{text_content}\n"
+        f"--- END OF DOCUMENT TEXT ---"
+    )
+    return [{"type": "text", "text": prompt_with_text}]
+
+
 class GroqExtractor(Extractor):
-    """Extractor using the Groq API with vision-capable models."""
+    """Extractor using the Groq API supporting both text-first and vision modes."""
 
     def __init__(self) -> None:
         self._client = Groq(
@@ -126,6 +154,7 @@ class GroqExtractor(Extractor):
                         max_completion_tokens=settings.groq_max_output_tokens,
                         response_format={"type": "json_object"},
                         reasoning_effort="none",
+                        seed=settings.groq_seed,
                     )
 
                 text = response.choices[0].message.content or ""
@@ -150,8 +179,7 @@ class GroqExtractor(Extractor):
                         status_code=429,
                     )
 
-                # Read retry-after from the response headers
-                retry_after = 20  # default
+                retry_after = 20
                 if hasattr(exc, "response") and exc.response is not None:
                     header_val = exc.response.headers.get("retry-after")
                     if header_val:
@@ -190,18 +218,29 @@ class GroqExtractor(Extractor):
                     status_code=502,
                 )
 
-    def extract(self, page_images: list[bytes]) -> tuple[InvoiceData, ExtractionMeta]:
-        """Extract structured invoice data from page images using Groq vision.
+    def extract(
+        self,
+        page_images: list[bytes],
+        text_content: str | None = None,
+        source: str = "image",
+    ) -> tuple[InvoiceData, ExtractionMeta]:
+        """Extract structured invoice data from page images or text content using Groq.
 
         Args:
             page_images: List of PNG image bytes.
+            text_content: Optional raw text layer from digital PDF.
+            source: "text" or "image".
 
         Returns:
             Tuple of (extracted invoice data, extraction metadata).
         """
-        base64_urls = images_to_base64_urls(page_images)
+        if source == "text" and text_content:
+            user_content = _build_text_user_content(text_content)
+        else:
+            base64_urls = images_to_base64_urls(page_images)
+            user_content = _build_image_user_content(base64_urls)
+            source = "image"
 
-        user_content = _build_user_content(base64_urls)
         messages = [{"role": "user", "content": user_content}]
 
         start_ms = time.monotonic_ns() // 1_000_000
@@ -211,8 +250,9 @@ class GroqExtractor(Extractor):
         elapsed_ms = (time.monotonic_ns() // 1_000_000) - start_ms
 
         logger.info(
-            "Groq extraction: model=%s latency=%dms input_tokens=%d output_tokens=%d",
+            "Groq extraction: model=%s source=%s latency=%dms input_tokens=%d output_tokens=%d",
             settings.groq_model,
+            source,
             elapsed_ms,
             input_tokens,
             output_tokens,
@@ -226,7 +266,6 @@ class GroqExtractor(Extractor):
         except ValueError as first_err:
             logger.warning("First parse failed: %s — attempting repair call", first_err)
 
-            # Repair attempt: send the error back and ask for corrected JSON
             repair_messages = messages + [
                 {"role": "assistant", "content": raw_text},
                 {
@@ -251,14 +290,17 @@ class GroqExtractor(Extractor):
                     status_code=502,
                 )
 
+        # Derive tax and subtotal if missing based on GST breakdown
+        invoice_data = derive_invoice_fields(invoice_data)
+
         meta = ExtractionMeta(
             model=settings.groq_model,
             latency_ms=elapsed_ms,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
-            pages_sent=[],  # Will be filled by extract_document()
+            pages_sent=[],
             repaired=repaired,
+            source=source,
         )
 
         return invoice_data, meta
-

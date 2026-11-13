@@ -18,6 +18,7 @@ from app.services.validation import detect_mime_type, sanitize_filename
 from app.services.storage import create_document_dir, delete_document
 from app.services.preprocessing import preprocess_document
 from app.services.extractor import extract_document
+from app.services.checks import run_checks
 
 import uuid
 
@@ -69,8 +70,22 @@ def main() -> None:
         print(f"  Input tokens:  {meta.input_tokens}")
         print(f"  Output tokens: {meta.output_tokens}")
         print(f"  Pages sent:    {meta.pages_sent}")
+        print(f"  Source mode:   {meta.source}")
         print(f"  Repaired:      {meta.repaired}")
         print(f"  Wall time:     {elapsed:.2f}s")
+
+        # Validation Checks & Review Flags
+        flags = run_checks(invoice_data)
+        needs_review = bool(flags)
+
+        print(f"\n{'='*60}")
+        print(f"VALIDATION FLAGS (needs_review={needs_review}):")
+        print('='*60)
+        if not flags:
+            print("  ✓ No flags raised. Document passes all checks cleanly.")
+        else:
+            for field, flag in flags.items():
+                print(f"  [{flag['severity'].upper()}] {field}: {flag['message']} ({flag['code']})")
 
     except Exception as exc:
         print(f"\nERROR: [{type(exc).__name__}] {exc}")

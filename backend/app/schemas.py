@@ -25,6 +25,31 @@ class InvoiceData(BaseModel):
     tax: float | None = None
     total: float | None = None
 
+    # GST & Tax Breakdown Additions
+    taxable_amount: float | None = None
+    cgst: float | None = None
+    sgst: float | None = None
+    igst: float | None = None
+    cess: float | None = None
+    prices_include_tax: bool | None = None
+
+
+def derive_invoice_fields(invoice: InvoiceData) -> InvoiceData:
+    """Derive tax and subtotal in code when explicit breakdown is available."""
+    # 1. Derive total tax from component breakdown if tax is missing
+    gst_parts = [invoice.cgst, invoice.sgst, invoice.igst, invoice.cess]
+    if any(p is not None for p in gst_parts):
+        total_gst = round(sum(p for p in gst_parts if p is not None), 2)
+        if invoice.tax is None or invoice.tax == 0:
+            invoice.tax = total_gst
+
+    # 2. Derive subtotal from taxable_amount
+    if invoice.taxable_amount is not None:
+        if invoice.subtotal is None or (invoice.prices_include_tax and invoice.subtotal == invoice.total):
+            invoice.subtotal = invoice.taxable_amount
+
+    return invoice
+
 
 class ExtractionMeta(BaseModel):
     """Metadata about the LLM extraction call."""
@@ -35,6 +60,7 @@ class ExtractionMeta(BaseModel):
     output_tokens: int
     pages_sent: list[int]
     repaired: bool = False
+    source: str = "image"  # "text" or "image"
 
 
 class PagePreview(BaseModel):
