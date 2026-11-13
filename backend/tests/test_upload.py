@@ -25,7 +25,8 @@ def test_upload_valid_pdf(client: TestClient, valid_pdf_bytes: bytes):
     data = response.json()
     assert data["mime_type"] == "application/pdf"
     assert data["filename"] == "invoice.pdf"
-    assert data["extraction"] is None
+    assert data["original"] is None
+    assert data["id"] is not None
 
 
 def test_upload_valid_png(client: TestClient, valid_png_bytes: bytes):

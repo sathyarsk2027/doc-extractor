@@ -15,11 +15,21 @@ from app.errors import AppError
 def guard_against_real_api_calls(monkeypatch, request):
     """Guarantee that tests never call real Groq API, protecting free quota."""
     # If a test is not in test_extraction, mock extract_document so upload/preprocessing tests don't hit the API
-    if "test_extraction" not in request.node.nodeid:
+    if "test_extraction" not in request.node.nodeid and "test_documents" not in request.node.nodeid:
         def _mock_extract(doc_id):
             raise AppError("MOCKED_EXTRACTION", "Extraction is mocked during tests.")
 
         monkeypatch.setattr("app.routes.extract.extract_document", _mock_extract)
+
+
+@pytest.fixture(autouse=True)
+def test_db(tmp_path, monkeypatch):
+    """Use an isolated temporary SQLite database for each test."""
+    temp_db = tmp_path / "test.db"
+    monkeypatch.setattr(settings, "db_path", str(temp_db))
+    from app.services.db import init_db
+    init_db(temp_db)
+    yield temp_db
 
 
 @pytest.fixture(scope="session")

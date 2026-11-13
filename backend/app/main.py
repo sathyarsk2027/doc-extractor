@@ -12,7 +12,10 @@ from app.config import settings
 from app.errors import AppError, ErrorDetail, ErrorResponse
 from app.routes.extract import router as extract_router
 from app.routes.files import router as files_router
+from app.routes.documents import router as documents_router
 from app.services.storage import cleanup_expired
+from app.services.db import init_db
+from app.services.documents import purge_retention
 
 logger = logging.getLogger("doc_extractor")
 logging.basicConfig(level=logging.INFO)
@@ -21,7 +24,19 @@ logging.basicConfig(level=logging.INFO)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Execute startup and shutdown lifecycle events."""
-    # Run storage TTL cleanup once at application startup
+    # 1. Initialize database schema
+    try:
+        init_db()
+    except Exception as exc:
+        logger.warning("Error running database initialization: %s", exc)
+
+    # 2. Purge documents older than RETENTION_DAYS
+    try:
+        purge_retention()
+    except Exception as exc:
+        logger.warning("Error running retention purge: %s", exc)
+
+    # 3. Run storage TTL cleanup for orphan folders
     try:
         cleanup_expired()
     except Exception as exc:
@@ -115,6 +130,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
 # Include API routers
 app.include_router(extract_router)
 app.include_router(files_router)
+app.include_router(documents_router)
 
 
 @app.get("/api/health", summary="Health Check")

@@ -14,6 +14,11 @@ venv/
 # Storage & uploads
 backend/storage/
 storage/
+backend/data/
+data/
+*.db
+*.db-wal
+*.db-shm
 
 # Node / Frontend
 node_modules/

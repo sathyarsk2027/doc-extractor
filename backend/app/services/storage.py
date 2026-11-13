@@ -100,6 +100,8 @@ def cleanup_expired(ttl_minutes: int | None = None) -> int:
     """Remove document directories older than FILE_TTL_MINUTES.
 
     Inspects folder modification times against current timestamp.
+    NEVER deletes a folder whose id exists in the documents table.
+    Orphan folders (not in the DB) still expire as before.
     Returns the count of deleted directories.
     """
     if ttl_minutes is None:
@@ -113,11 +115,26 @@ def cleanup_expired(ttl_minutes: int | None = None) -> int:
     if not storage_root.exists() or not storage_root.is_dir():
         return 0
 
+    saved_doc_ids: set[str] = set()
+    try:
+        from app.services.db import get_db
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id FROM documents")
+            saved_doc_ids = {row[0] for row in cursor.fetchall()}
+    except Exception:
+        # If DB query fails, play safe and do not treat any as orphan
+        pass
+
     for entry in storage_root.iterdir():
         if entry.is_dir():
             try:
                 # Validate that folder name is a valid UUID before touching
-                uuid.UUID(entry.name, version=4)
+                uuid_str = str(uuid.UUID(entry.name, version=4))
+                if uuid_str in saved_doc_ids:
+                    # Persisted in documents table: NEVER delete
+                    continue
+
                 mtime = entry.stat().st_mtime
                 if (now - mtime) > ttl_seconds:
                     shutil.rmtree(entry, ignore_errors=True)

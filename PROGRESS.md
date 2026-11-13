@@ -162,3 +162,22 @@
 - **Regression test on samples/invoice.pdf (Call #8)**: Extracted ACME SUPPLIES CORP cleanly via text mode (`source="text"`), reducing input tokens to 1,105 (from 3,956). Subtotal $650.00, Tax $52.00, Total $702.00, 5 line items. 0 flags raised (`needs_review=False`). Confirms no regressions introduced.
 - **Image path test on samples/store_receipt.png (Call #9)**: Tested vision path with a real receipt scan (`source="image"`, 2,664 input tokens). Correctly extracted ACME Supplies Inc., #1024, USD, total 142.50. Accurately flagged missing date and no line items.
 - **Total real API calls**: 9 of 14 used.
+
+## Phase 5: Persistence and Document API
+- **Step 5.1 Database setup (`services/db.py`)**: Added SQLite database connection service with WAL mode, foreign keys enabled (`PRAGMA foreign_keys=ON`), schema versioning (`PRAGMA user_version`), and tables `documents` and `extractions` with cascade deletion. Added `DB_PATH` (`data/app.db`) and `RETENTION_DAYS` (default 30) settings. Gitignored `data/`, `*.db`, and WAL files.
+- **Step 5.2 Keep saved files & retention purge (`services/storage.py`)**: Updated `cleanup_expired()` to protect any folder whose ID exists in the `documents` table while removing orphan folders older than TTL. Added `purge_retention()` to delete documents older than `RETENTION_DAYS` at startup lifespan.
+- **Step 5.3 Repository and schemas (`services/documents.py`, `schemas.py`)**: Implemented `DocumentSummary`, `DocumentDetail`, `ErrorPayload`, and `DocumentUpdateRequest` schemas. Built repository functions: `save_extracted_document`, `get_document_by_id`, `list_documents`, `update_document_data`, `delete_document_record`, `delete_all_documents`, `purge_retention`.
+- **Step 5.4 Document API endpoints (`routes/documents.py`, `routes/extract.py`)**:
+  - `POST /api/extract`: Saves extracted document and returns `DocumentDetail`. On extraction error, saves record with error envelope and status `needs_review` while returning 200 with previews.
+  - `GET /api/documents`: Returns list of `DocumentSummary`, newest first, with status filter, limit (capped at 200), and offset.
+  - `GET /api/documents/{id}`: Returns full `DocumentDetail` (404 on missing or invalid UUID).
+  - `PUT /api/documents/{id}`: Updates `reviewed_json`, recomputes checks/flags; marks `reviewed` with timestamp if `mark_reviewed=True`.
+  - `POST /api/documents/{id}/reextract`: Retries extraction on preprocessed files for failed/rate-limited documents.
+  - `DELETE /api/documents/{id}`: Deletes DB rows and disk directory.
+  - `DELETE /api/documents?confirm=true`: Purges all documents and storage folders (400 if confirm missing).
+- **Step 5.5 Tests (`tests/test_documents.py`)**: Added 7 comprehensive integration tests covering persistence across DB reconnection, TTL protection of saved folders, status filtering and pagination, flag recomputation and review marking, failed extraction saving and re-extraction, deletion and confirm safety, and UUID/injection safety. Updated existing tests to match `DocumentDetail` response schema.
+- **Verification result**:
+  - `pytest -q`: 77 passed in 2.43s (all tests mocked, 0 real API calls).
+  - Persistence verified via `scripts/verify_phase5.py`: uploaded synthetic document on live backend, restarted server, verified listing in `GET /api/documents` and preview fetch from `/api/files/{id}/pages/1.png` (HTTP 200 PNG).
+  - Git status verified: `data/` and `storage/` are untracked and gitignored.
+

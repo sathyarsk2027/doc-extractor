@@ -5,10 +5,11 @@ import uuid
 from fastapi import APIRouter, File, UploadFile
 
 from app.errors import AppError
-from app.schemas import ExtractResponse, PagePreview
+from app.schemas import DocumentDetail, PagePreview
 from app.services.validation import validate_upload
 from app.services.extractor import extract_document
 from app.services.checks import run_checks
+from app.services.documents import save_extracted_document
 from app.services.storage import (
     save_original,
     delete_document,
@@ -22,8 +23,8 @@ logger = logging.getLogger("doc_extractor")
 router = APIRouter(prefix="/api", tags=["Extraction"])
 
 
-@router.post("/extract", response_model=ExtractResponse, summary="Upload document for extraction")
-def extract_endpoint(file: UploadFile = File(...)) -> ExtractResponse:
+@router.post("/extract", response_model=DocumentDetail, summary="Upload document for extraction")
+def extract_endpoint(file: UploadFile = File(...)) -> DocumentDetail:
     """Validate uploaded document, preprocess pages, and execute extraction pipeline.
 
     This is a sync def so FastAPI runs it in a thread pool, allowing the
@@ -92,10 +93,11 @@ def extract_endpoint(file: UploadFile = File(...)) -> ExtractResponse:
     flags: dict = {}
     needs_review = True
 
+    invoice_data = None
+    meta = None
+
     try:
         invoice_data, meta = extract_document(document_id)
-        extraction = invoice_data.model_dump()
-        extraction_meta = meta.model_dump()
         # Run validation checks on extracted structured data
         flags = run_checks(invoice_data)
         needs_review = bool(flags)
@@ -113,16 +115,18 @@ def extract_endpoint(file: UploadFile = File(...)) -> ExtractResponse:
         flags = {}
         needs_review = True
 
-    return ExtractResponse(
+    source = meta.source if meta else "image"
+    doc_detail = save_extracted_document(
         document_id=document_id,
         filename=sanitized_filename,
         mime_type=mime_type,
         page_count=len(pages),
         pages=pages,
-        extraction=extraction,
-        extraction_meta=extraction_meta,
-        extraction_error=extraction_error,
+        source=source,
+        original_data=invoice_data,
         flags=flags,
-        needs_review=needs_review,
-        message="Extraction complete." if extraction else "Preprocessing complete. Extraction failed.",
+        meta=meta,
+        error=extraction_error,
     )
+
+    return doc_detail

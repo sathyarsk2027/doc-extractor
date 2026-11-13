@@ -32,6 +32,16 @@ class Settings(BaseModel):
     pdf_render_dpi: int = int(os.getenv("PDF_RENDER_DPI", "150"))
     storage_dir: str = os.getenv("STORAGE_DIR", "storage")
     file_ttl_minutes: int = int(os.getenv("FILE_TTL_MINUTES", "60"))
+    db_path: str = os.getenv("DB_PATH", "data/app.db")
+    retention_days: int = int(os.getenv("RETENTION_DAYS", "30"))
+
+    @property
+    def db_file_path(self) -> Path:
+        """Return the resolved database file Path."""
+        p = Path(self.db_path)
+        if not p.is_absolute():
+            p = BACKEND_DIR / p
+        return p
 
     @property
     def storage_path(self) -> Path:

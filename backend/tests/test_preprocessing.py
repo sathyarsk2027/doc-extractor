@@ -33,12 +33,12 @@ def test_multipage_pdf_preprocessing(client: TestClient):
     res = client.post("/api/extract", files={"file": ("multipage.pdf", pdf_bytes, "application/pdf")})
     assert res.status_code == 200
     data = res.json()
-    assert data["document_id"] is not None
+    assert data["id"] is not None
     assert data["page_count"] == 3
     assert len(data["pages"]) == 3
 
     for p in data["pages"]:
-        assert p["preview_url"].startswith(f"/api/files/{data['document_id']}/pages/")
+        assert p["preview_url"].startswith(f"/api/files/{data['id']}/pages/")
         assert p["width"] > 0
         assert p["height"] > 0
 
@@ -137,7 +137,7 @@ def test_preview_endpoint_security_and_404(client: TestClient, valid_png_bytes: 
     # Upload valid file to get real ID
     res = client.post("/api/extract", files={"file": ("doc.png", valid_png_bytes, "image/png")})
     assert res.status_code == 200
-    doc_id = res.json()["document_id"]
+    doc_id = res.json()["id"]
 
     # 1. Valid preview
     valid_res = client.get(f"/api/files/{doc_id}/pages/1.png")

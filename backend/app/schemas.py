@@ -72,6 +72,54 @@ class PagePreview(BaseModel):
     height: int = Field(..., description="Preview image height in pixels")
 
 
+class ErrorPayload(BaseModel):
+    """Error code and message payload."""
+
+    code: str
+    message: str
+
+
+class DocumentSummary(BaseModel):
+    """Summary of a document for history list display."""
+
+    id: str
+    filename: str
+    created_at: str
+    status: str
+    page_count: int
+    vendor: str | None = None
+    total: float | None = None
+    currency: str | None = None
+    needs_review: bool
+
+
+class DocumentDetail(BaseModel):
+    """Full detail of a document, its pages, extractions, and flags."""
+
+    id: str
+    filename: str
+    mime_type: str
+    page_count: int
+    status: str
+    created_at: str
+    updated_at: str
+    reviewed_at: str | None = None
+    pages: list[PagePreview] = Field(default_factory=list)
+    original: InvoiceData | None = None
+    reviewed: InvoiceData | None = None
+    flags: dict[str, Any] = Field(default_factory=dict)
+    needs_review: bool
+    meta: ExtractionMeta | None = None
+    error: ErrorPayload | None = None
+
+
+class DocumentUpdateRequest(BaseModel):
+    """Payload for updating document extracted data and review status."""
+
+    data: InvoiceData
+    mark_reviewed: bool = False
+
+
 class ExtractResponse(BaseModel):
     """Response schema for POST /api/extract."""
 

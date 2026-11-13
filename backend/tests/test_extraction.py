@@ -330,10 +330,10 @@ class TestRouteExtractionError:
 
         assert response.status_code == 200
         data = response.json()
-        assert data["extraction"] is None
-        assert data["extraction_error"]["code"] == "RATE_LIMITED"
-        assert data["extraction_error"]["message"].startswith("The free AI quota")
-        assert data["document_id"] is not None
+        assert data["original"] is None
+        assert data["error"]["code"] == "RATE_LIMITED"
+        assert data["error"]["message"].startswith("The free AI quota")
+        assert data["id"] is not None
         assert len(data["pages"]) == 1
         assert data["pages"][0]["preview_url"].endswith("1.png")
 
