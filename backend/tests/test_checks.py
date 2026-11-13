@@ -269,6 +269,7 @@ def test_rounded_total_case():
     """Line items sum to 99.99, total 100.00 -> no flag (within tolerance)."""
     invoice = InvoiceData(
         vendor="Acme Corp",
+        invoice_number="INV-001",
         date="2025-06-15",
         currency="USD",
         line_items=[
@@ -367,3 +368,20 @@ def test_tax_inclusive_invoice_mismatch_both_triggers_flag_with_hint():
     assert "line_items" in flags
     assert flags["line_items"]["code"] == "LINE_SUM_MISMATCH"
     assert "tax-inclusive" in flags["line_items"]["message"]
+
+
+def test_invoice_number_missing_is_warning():
+    """Missing or empty invoice_number produces INVOICE_NUMBER_MISSING warning, not error."""
+    inv_none = _base_valid_invoice()
+    inv_none.invoice_number = None
+    flags = run_checks(inv_none)
+    assert "invoice_number" in flags
+    assert flags["invoice_number"]["code"] == "INVOICE_NUMBER_MISSING"
+    assert flags["invoice_number"]["severity"] == "warning"
+
+    inv_empty = _base_valid_invoice()
+    inv_empty.invoice_number = "   "
+    flags_empty = run_checks(inv_empty)
+    assert "invoice_number" in flags_empty
+    assert flags_empty["invoice_number"]["code"] == "INVOICE_NUMBER_MISSING"
+    assert flags_empty["invoice_number"]["severity"] == "warning"

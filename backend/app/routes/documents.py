@@ -4,7 +4,7 @@ import json
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Response
 
 from app.errors import AppError
 from app.schemas import (
@@ -19,9 +19,11 @@ from app.services.documents import (
     delete_all_documents,
     delete_document_record,
     get_document_by_id,
+    get_documents_by_status,
     list_documents,
     update_document_data,
 )
+from app.services.export import generate_documents_csv, sanitize_download_filename
 from app.services.extractor import extract_document
 from app.services.storage import validate_document_id
 
@@ -53,6 +55,42 @@ def delete_all_endpoint(
         )
     count = delete_all_documents()
     return {"deleted": count, "message": f"Successfully deleted {count} documents."}
+
+
+@router.get("/export.csv", summary="Bulk export documents to CSV")
+def bulk_export_csv_endpoint(
+    status: str = Query("reviewed", description="Status filter: reviewed or all"),
+) -> Response:
+    """Export all matching documents to a single CSV file with UTF-8 BOM."""
+    docs = get_documents_by_status(status=status)
+    csv_bytes = generate_documents_csv(docs)
+    return Response(
+        content=csv_bytes,
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": 'attachment; filename="documents_export.csv"',
+            "Content-Type": "text/csv; charset=utf-8",
+        },
+    )
+
+
+@router.get("/{id}/export.csv", summary="Export single document to CSV")
+def single_export_csv_endpoint(id: str) -> Response:
+    """Export a single document to CSV with UTF-8 BOM."""
+    validate_document_id(id)
+    doc = get_document_by_id(id)
+    if not doc:
+        raise AppError(code="NOT_FOUND", message="Document not found.", status_code=404)
+    csv_bytes = generate_documents_csv([doc])
+    safe_filename = sanitize_download_filename(doc.filename)
+    return Response(
+        content=csv_bytes,
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{safe_filename}"',
+            "Content-Type": "text/csv; charset=utf-8",
+        },
+    )
 
 
 @router.get("/{id}", response_model=DocumentDetail, summary="Get document detail")

@@ -4,6 +4,7 @@ import json
 import os
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -15,6 +16,7 @@ from app.config import settings
 from app.errors import AppError
 from app.schemas import InvoiceData, ExtractionMeta, LineItem
 from app.services.db import get_db, init_db
+from app.services.documents import purge_retention, get_document_by_id
 from app.services.storage import cleanup_expired, get_document_dir
 
 
@@ -44,7 +46,7 @@ def _synthetic_invoice(vendor="Alpha Labs", total=100.0, subtotal=90.0, tax=10.0
     )
 
 
-def test_upload_creates_db_rows_and_survives_restart(client: TestClient):
+def test_persistence_across_restart(client: TestClient):
     """Uploaded document creates rows in SQLite, which survive DB reconnect/restart."""
     inv = _synthetic_invoice()
     meta = ExtractionMeta(
@@ -281,8 +283,49 @@ def test_failed_extraction_saved_with_error_and_can_be_retried(client: TestClien
     assert re_data["original"]["vendor"] == "Alpha Labs"
 
 
-def test_delete_single_and_delete_all(client: TestClient):
-    """Single delete removes record and folder; delete all requires confirm=true."""
+def test_delete_removes_rows_and_files_cascade(client: TestClient):
+    """Single delete removes documents row, extractions row via ON DELETE CASCADE, and storage folder."""
+    inv = _synthetic_invoice()
+    meta = ExtractionMeta(
+        model="mock", latency_ms=10, input_tokens=10, output_tokens=10, pages_sent=[1], source="image"
+    )
+
+    with patch("app.routes.extract.extract_document", return_value=(inv, meta)):
+        res = client.post("/api/extract", files={"file": ("doc_cascade.pdf", _make_pdf(), "application/pdf")})
+
+    doc_id = res.json()["id"]
+    doc_dir = get_document_dir(doc_id)
+    assert doc_dir.exists()
+
+    # Verify rows exist in both documents and extractions before deletion
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM documents WHERE id = ?", (doc_id,))
+        assert cursor.fetchone()[0] == 1
+        cursor.execute("SELECT COUNT(*) FROM extractions WHERE document_id = ?", (doc_id,))
+        assert cursor.fetchone()[0] == 1
+
+    # Delete via endpoint
+    del_res = client.delete(f"/api/documents/{doc_id}")
+    assert del_res.status_code == 200
+
+    # Verify disk folder is removed
+    assert not doc_dir.exists()
+
+    # Verify both documents row and extractions row (CASCADE) are gone from DB
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM documents WHERE id = ?", (doc_id,))
+        assert cursor.fetchone()[0] == 0
+        cursor.execute("SELECT COUNT(*) FROM extractions WHERE document_id = ?", (doc_id,))
+        assert cursor.fetchone()[0] == 0
+
+    # Verify 404 on subsequent GET
+    assert client.get(f"/api/documents/{doc_id}").status_code == 404
+
+
+def test_delete_all_requires_confirm(client: TestClient):
+    """DELETE /api/documents requires confirm=true; purges all documents and files when confirmed."""
     inv = _synthetic_invoice()
     meta = ExtractionMeta(
         model="mock", latency_ms=10, input_tokens=10, output_tokens=10, pages_sent=[1], source="image"
@@ -294,43 +337,120 @@ def test_delete_single_and_delete_all(client: TestClient):
 
     id1 = res1.json()["id"]
     id2 = res2.json()["id"]
+    dir1 = get_document_dir(id1)
+    dir2 = get_document_dir(id2)
+    assert dir1.exists()
+    assert dir2.exists()
 
-    doc_dir1 = get_document_dir(id1)
-    assert doc_dir1.exists()
+    # Delete all without confirm -> 400 CONFIRM_REQUIRED
+    bad_res = client.delete("/api/documents")
+    assert bad_res.status_code == 400
+    assert bad_res.json()["error"]["code"] == "CONFIRM_REQUIRED"
+    assert dir1.exists()
 
-    # Delete id1
-    del_res = client.delete(f"/api/documents/{id1}")
-    assert del_res.status_code == 200
-    assert not doc_dir1.exists()
-
-    # Verify id1 is 404
-    assert client.get(f"/api/documents/{id1}").status_code == 404
-
-    # Delete all without confirm -> 400
-    bad_del = client.delete("/api/documents")
-    assert bad_del.status_code == 400
-    assert bad_del.json()["error"]["code"] == "CONFIRM_REQUIRED"
+    # Delete all with confirm=false -> 400
+    bad_res2 = client.delete("/api/documents?confirm=false")
+    assert bad_res2.status_code == 400
+    assert bad_res2.json()["error"]["code"] == "CONFIRM_REQUIRED"
 
     # Delete all with confirm=true -> 200
-    good_del = client.delete("/api/documents?confirm=true")
-    assert good_del.status_code == 200
+    good_res = client.delete("/api/documents?confirm=true")
+    assert good_res.status_code == 200
+    assert good_res.json()["deleted"] >= 2
 
-    # Verify id2 is also gone
-    assert client.get(f"/api/documents/{id2}").status_code == 404
-    assert not get_document_dir(id2).exists()
+    # Verify directories and database records are completely wiped
+    assert not dir1.exists()
+    assert not dir2.exists()
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM documents")
+        assert cursor.fetchone()[0] == 0
+        cursor.execute("SELECT COUNT(*) FROM extractions")
+        assert cursor.fetchone()[0] == 0
 
 
-def test_invalid_uuid_and_sql_injection_safety(client: TestClient):
-    """Invalid UUIDs and traversal attempts return 404; SQL injection query params are harmless."""
-    # 404 on invalid UUID format
+def test_invalid_uuid_and_path_traversal_returns_404(client: TestClient):
+    """Invalid UUIDs and traversal attempts return 404 error without server errors."""
     assert client.get("/api/documents/invalid-uuid-123").status_code == 404
     assert client.get("/api/documents/../../etc/passwd").status_code == 404
     assert client.put("/api/documents/invalid-uuid", json={"data": _synthetic_invoice().model_dump()}).status_code == 404
     assert client.delete("/api/documents/invalid-uuid").status_code == 404
     assert client.post("/api/documents/invalid-uuid/reextract").status_code == 404
 
-    # SQL injection in status parameter
+
+def test_sql_injection_in_status_is_harmless(client: TestClient):
+    """SQL injection patterns in the status parameter are parameterized and harmless."""
     inj_res = client.get("/api/documents?status=' OR '1'='1")
     assert inj_res.status_code == 200
     assert inj_res.json() == []
 
+
+def test_retention_purge_removes_old_keeps_new_and_zero_disables():
+    """Documents older than RETENTION_DAYS are purged (rows and files), newer kept, and 0 disables."""
+    storage_root = settings.storage_path
+    storage_root.mkdir(parents=True, exist_ok=True)
+
+    old_id = str(uuid.uuid4())
+    new_id = str(uuid.uuid4())
+
+    old_dir = storage_root / old_id
+    old_dir.mkdir(parents=True, exist_ok=True)
+    (old_dir / "page_1.png").write_bytes(b"old")
+
+    new_dir = storage_root / new_id
+    new_dir.mkdir(parents=True, exist_ok=True)
+    (new_dir / "page_1.png").write_bytes(b"new")
+
+    # Timestamps
+    old_date = (datetime.now(timezone.utc) - timedelta(days=45)).isoformat()
+    new_date = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO documents (
+                id, filename, mime_type, page_count, pages_json, status, source,
+                created_at, updated_at
+            ) VALUES
+            (?, 'old.pdf', 'application/pdf', 1, '[]', 'extracted', 'image', ?, ?),
+            (?, 'new.pdf', 'application/pdf', 1, '[]', 'extracted', 'image', ?, ?)
+            """,
+            (old_id, old_date, old_date, new_id, new_date, new_date),
+        )
+        cursor.execute(
+            """
+            INSERT INTO extractions (document_id, flags_json) VALUES (?, '{}'), (?, '{}')
+            """,
+            (old_id, new_id),
+        )
+
+    # 1. RETENTION_DAYS=0 disables purge
+    purged_zero = purge_retention(retention_days=0)
+    assert purged_zero == 0
+    assert old_dir.exists()
+    assert new_dir.exists()
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM documents WHERE id = ?", (old_id,))
+        assert cursor.fetchone()[0] == 1
+
+    # 2. RETENTION_DAYS=30 purges 45-day-old document, keeps 2-day-old document
+    purged = purge_retention(retention_days=30)
+    assert purged == 1
+
+    # Old document rows and folder removed
+    assert not old_dir.exists()
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM documents WHERE id = ?", (old_id,))
+        assert cursor.fetchone()[0] == 0
+        cursor.execute("SELECT COUNT(*) FROM extractions WHERE document_id = ?", (old_id,))
+        assert cursor.fetchone()[0] == 0
+
+        # New document rows and folder intact
+        cursor.execute("SELECT COUNT(*) FROM documents WHERE id = ?", (new_id,))
+        assert cursor.fetchone()[0] == 1
+        cursor.execute("SELECT COUNT(*) FROM extractions WHERE document_id = ?", (new_id,))
+        assert cursor.fetchone()[0] == 1
+    assert new_dir.exists()

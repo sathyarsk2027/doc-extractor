@@ -181,3 +181,52 @@
   - Persistence verified via `scripts/verify_phase5.py`: uploaded synthetic document on live backend, restarted server, verified listing in `GET /api/documents` and preview fetch from `/api/files/{id}/pages/1.png` (HTTP 200 PNG).
   - Git status verified: `data/` and `storage/` are untracked and gitignored.
 
+## Phase 5 Verification & Test Expansion
+- **Expanded persistence tests**: Added separate dedicated tests in `tests/test_documents.py` for cascade row deletion on SQLite foreign keys (`ON DELETE CASCADE`), delete-all confirmation guard, retention purge (`RETENTION_DAYS` removal, retention period = 0 disable), distinct 404 handling on invalid UUID/path-traversal, and SQL injection safety on status filtering. Full test suite: 80 passed.
+- **Assertion integrity**: Verified with `git diff 9f6104c..932f2f4` that zero assertions in `test_upload.py`, `test_preprocessing.py`, and `test_extraction.py` were removed or weakened.
+- **Path resolution check**: Verified `settings.db_file_path` resolves identically relative to the backend directory whether initiated from repo root or backend folder.
+- **Ignore verification**: Verified `.gitignore:18` and `.gitignore:16` match `backend/data/app.db` and `backend/storage`.
+
+## Phase 6 Follow-up Fixes: UI & Extraction Refinements
+- **Dot Marker ("Changed from AI")**: Created `frontend/src/utils/diff.js` equating `null`, `undefined`, and `""`. Added numeric comparison (`parseFloat`) and date validity checks to prevent untouched empty fields or invalid dates from falsely displaying the purple dot indicator. Added unit tests in `frontend/src/utils/diff.test.js` (4/4 tests passed). Added tooltip `title="Changed from AI"` on dot indicators.
+- **Invoice Number Extraction & Validation**:
+  - Updated Rule 7 in `EXTRACTION_PROMPT` (`services/groq_extractor.py`): `"Bill No.", "Invoice No." and "Tax Invoice#" all mean invoice_number; copy the digits exactly.`
+  - Added warning-level validation check `INVOICE_NUMBER_MISSING` in `services/checks.py`. Added test in `tests/test_checks.py`.
+  - Re-extracted `samples/7474.pdf` live (Real Call #2 of Phase 5-7 budget): successfully extracted `invoice_number: "621418926514866"`, 0 error flags.
+- **Line-Item Flag Layout**: Refactored `LineItemsTable.jsx` to render line item validation flags in a dedicated full-width `<tr>` (`<td colSpan={5}>`) directly below the item row. Kept severity styling (amber warning / red error) and eliminated narrow-column input distortion in the Amount column.
+- **Verification result**: `npm run lint` and `npm run build` passed with 0 errors/warnings. Node test runner passed `diff.test.js`.
+
+## Phase 7: CSV Export
+- **Step 7.1 Backend Export Service (`services/export.py`)**:
+  - Implemented `generate_documents_csv(docs)` using Python standard library `csv` module and `io.StringIO`.
+  - Encoded with `utf-8-sig` (UTF-8 BOM: `\xef\xbb\xbf`) for automatic native opening in Microsoft Excel without character corruption or wizard dialogs.
+  - Implemented formula-injection sanitization (`sanitize_csv_text`): prefixes strings starting with `'`, `+`, `-`, `=`, `@`, `\t`, `\r` with a single quote `'`, while preserving numeric negative numbers (e.g., `-5.00` remains numeric).
+  - Clean decimal float formatting (e.g. `0.1 + 0.2` formats as `0.30`).
+  - RFC 4180 compliant column structure: `document_id,filename,vendor,invoice_number,date,currency,subtotal,tax,total,item_description,item_quantity,item_unit_price,item_amount,status,needs_review,flag_codes`.
+  - One line per line item; documents with 0 line items output exactly 1 row with empty item columns. Prefers `reviewed` data over `original`.
+- **Step 7.2 API Endpoints (`routes/documents.py`)**:
+  - `GET /api/documents/{id}/export.csv`: Exports single document with `Content-Disposition: attachment; filename="export_{id}.csv"`.
+  - `GET /api/documents/export.csv`: Bulk export with query parameter `status=reviewed` (default) or `status=all` and header `Content-Disposition: attachment; filename="invoices_export.csv"`.
+- **Step 7.3 Frontend CSV Download Links**:
+  - `ReviewView.jsx`: Added "Download CSV" link triggering `GET /api/documents/{id}/export.csv`. Appends `(Contains unreviewed data)` hint if `status !== "reviewed"`.
+  - `HistoryView.jsx`: Added "Export reviewed (CSV)" button triggering `GET /api/documents/export.csv?status=reviewed`.
+- **Step 7.4 Export Test Suite (`tests/test_export.py`)**:
+  - Implemented 7 table-driven tests:
+    1. `test_single_document_export_csv_bom_and_headers`: Verifies UTF-8 BOM bytes (`\xef\xbb\xbf`) and exact headers.
+    2. `test_csv_formula_injection_sanitization`: Verifies formula injection prevention (`=cmd`, `@SUM`, `+calc`, `-item`) while negative floats (`-5.00`) are not mangled.
+    3. `test_document_with_no_line_items_outputs_one_row`: Verifies empty item columns for documents without items.
+    4. `test_float_rounding_in_csv`: Verifies `0.1 + 0.2` outputs `0.30`.
+    5. `test_reviewed_data_preferred_over_original`: Verifies corrected reviewed fields are exported.
+    6. `test_bulk_export_csv_filtering`: Verifies `status=reviewed` vs `status=all`.
+    7. `test_export_csv_missing_or_invalid_id`: Verifies 404 response on invalid UUID.
+- **Verification result**:
+  - `pytest -q`: **88 passed in 6.59s** (all mocked, zero API calls).
+  - `npm run lint`: 0 errors, 0 warnings.
+  - `npm run build`: built in 2.02s cleanly (all components < 200 lines).
+  - `python scripts/verify_phase7.py`:
+    - BOM Raw Bytes: `b'\xef\xbb\xbf'`
+    - BOM Hex: `['0xef', '0xbb', '0xbf']`
+  - Real API budget: **2 of 3 calls used** across Phases 5-7. Git status: clean of `data/` and `storage/`.
+
+
+

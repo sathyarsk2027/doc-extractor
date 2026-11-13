@@ -57,6 +57,15 @@ def run_checks(invoice: InvoiceData) -> dict[str, dict[str, str]]:
     if invoice.total is None:
         _set_flag("total", "REQUIRED_MISSING", "Total amount is missing.", "error")
 
+    # 1b. INVOICE_NUMBER_MISSING (warning): invoice_number is null or empty
+    if not invoice.invoice_number or not str(invoice.invoice_number).strip():
+        _set_flag(
+            "invoice_number",
+            "INVOICE_NUMBER_MISSING",
+            "Invoice number is missing.",
+            "warning",
+        )
+
     # 2. DATE_INVALID (error) & DATE_SUSPICIOUS (warning)
     if invoice.date and invoice.date.strip():
         parsed_date: date | None = None

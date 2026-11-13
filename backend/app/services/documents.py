@@ -167,6 +167,30 @@ def get_document_by_id(document_id: str) -> DocumentDetail | None:
         return _row_to_document_detail(row)
 
 
+def get_documents_by_status(status: str | None = None) -> list[DocumentDetail]:
+    """Retrieve full details of all documents matching status, or all if status is 'all' or None."""
+    query = """
+        SELECT d.id, d.filename, d.mime_type, d.page_count, d.pages_json,
+               d.status, d.source, d.created_at, d.updated_at, d.reviewed_at,
+               e.original_json, e.reviewed_json, e.flags_json, e.meta_json, e.error_json
+        FROM documents d
+        LEFT JOIN extractions e ON d.id = e.document_id
+    """
+    params = []
+    if status and status != "all":
+        query += " WHERE d.status = ?"
+        params.append(status)
+
+    query += " ORDER BY d.created_at DESC, d.rowid DESC"
+
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+
+    return [_row_to_document_detail(r) for r in rows]
+
+
 def list_documents(
     status: str | None = None,
     limit: int = 50,

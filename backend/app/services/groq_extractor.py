@@ -54,7 +54,7 @@ Strict Rules:
 4. Date format: "date" must be in YYYY-MM-DD format (ISO 8601). If the printed date is e.g. "05-11-2026", convert it to "2026-11-05".
 5. Numbers: Plain numbers only without currency symbols or thousands separators. Example: 1582.00 not "Rs. 1,582.00".
 6. Currency: 3-letter ISO 4217 code (e.g. INR, USD, EUR, GBP).
-7. Copy text (vendor name, item descriptions, invoice number) exactly as printed on the document.
+7. Copy text (vendor name, item descriptions, invoice number) exactly as printed on the document. "Bill No.", "Invoice No." and "Tax Invoice#" all mean invoice_number; copy the digits exactly.
 8. GST / Tax Summary Table Rule:
    - When a GST or tax breakdown table is present (e.g. columns for Taxable, CGST, SGST, IGST, CESS), extract amounts from the TOTAL row (often labelled with "T:", "Total", or at the bottom line).
    - "taxable_amount": total taxable value from the summary total row.
