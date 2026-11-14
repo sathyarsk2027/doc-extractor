@@ -1,0 +1,37 @@
+{
+  "doc_id": "example_inv01",
+  "source_file": "example_inv01.pdf",
+  "document_kind": "digital_pdf",
+  "_status": "verified",
+  "expected": {
+    "vendor": "Acme Industrial Supplies Inc.",
+    "invoice_number": "INV-2026-0042",
+    "date": "2026-04-15",
+    "currency": "USD",
+    "subtotal": 125.0,
+    "taxable_amount": 125.0,
+    "cgst": null,
+    "sgst": null,
+    "igst": null,
+    "cess": null,
+    "tax": 10.0,
+    "total": 135.0,
+    "prices_include_tax": false,
+    "line_items": [
+      {
+        "description": "Standard Widget Model A",
+        "quantity": 2.0,
+        "unit_price": 50.0,
+        "amount": 100.0
+      },
+      {
+        "description": "Widget Maintenance Kit",
+        "quantity": 1.0,
+        "unit_price": 25.0,
+        "amount": 25.0
+      }
+    ]
+  },
+  "notes": "Synthetic example ground truth annotation for documentation purposes."
+}
+

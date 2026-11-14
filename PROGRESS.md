@@ -228,5 +228,200 @@
     - BOM Hex: `['0xef', '0xbb', '0xbf']`
   - Real API budget: **2 of 3 calls used** across Phases 5-7. Git status: clean of `data/` and `storage/`.
 
+## Phase 8: Evaluation & Benchmarking
+
+### Step A1: Evaluation Layout & Tooling Structure
+- **Package creation**: Created `backend/evaluation/` package with `__init__.py`, `cli.py`, `pipeline_runner.py`, `ground_truth.py`, `variants.py`, `scoring.py`, and `report.py`.
+- **CLI setup**: Implemented unified CLI `python -m evaluation.cli <command>` supporting subcommands `templates`, `check-gt`, `variants`, `plan`, `run` (with `--limit`, `--only`, `--force`, `--repeats`), `score`, `report`, and `timing`.
+- **Evaluation data directories**: Created top-level evaluation directories with `.gitkeep` files: `eval/data/`, `eval/ground_truth/`, `eval/variants/`, `eval/results/`, and `eval/report/`.
+- **Gitignore configuration**: Updated `.gitignore` to strictly ignore all files under `eval/data/*`, `eval/ground_truth/*`, `eval/variants/*`, `eval/results/*`, and `eval/report/*` while preserving `.gitkeep`, `eval/report/summary.md`, `eval/README.md`, and `eval/ground_truth.example.json`. Anchored `/data/` and `/storage/` root ignores to prevent collisions with `eval/data/`.
+- **Verification**:
+  - Verified `python -m evaluation.cli --help` outputs all 8 subcommands and options cleanly.
+  - Verified with `git check-ignore -v` that private folders (`eval/data/`, `eval/ground_truth/`, `eval/variants/`, `eval/results/`) are ignored while `.gitkeep`, `summary.md`, `README.md`, and `ground_truth.example.json` remain trackable.
+  - Verified git status shows zero private data or secret leaks. Baseline test suite verified by user (88 passed in 3.29s).
+
+### Step A2: DB-Free Pipeline Runner & Extraction Mode Override
+- **Pipeline Runner Implementation (`evaluation/pipeline_runner.py`)**:
+  - Implemented `run_pipeline_on_file(path, mode=None) -> PipelineResult`:
+    - Reads input document and determines MIME type (`application/pdf`, `image/png`, `image/jpeg`).
+    - Isolates document processing in an ephemeral `storage/{document_id}/` folder without inserting any rows into SQLite.
+    - Preprocesses pages to preview PNGs.
+    - Invokes extraction with per-call extraction mode override (`mode_override`), allowing explicit `text`, `image`, or `auto` without mutating global settings.
+    - Executes validation checks via `run_checks(invoice_data)` to produce `flags` and `needs_review`.
+    - Captures extraction metadata (model, latency, tokens in/out, pages sent, source modality, repaired status).
+    - Robust error envelope: handles missing files, unhandled exceptions, and `AppError` (e.g. rate limit / auth / parsing error) returning structured error payloads.
+    - `finally` block strictly purges `storage/{document_id}/` temporary files via `delete_document(document_id)`.
+  - Added `has_usable_text_layer(path, min_chars=50)` utility to inspect whether a PDF has an embedded digital text layer.
+  - Added `PipelineResult.to_dict()` and `PipelineResult.from_dict()` for lossless serialization and deserialization.
+- **Minimal Core App Modification**:
+  - Added optional `mode_override: str | None = None` parameter to `extract_document(document_id, mode_override=None)` in `backend/app/services/extractor.py`.
+  - Diff stat: `backend/app/services/extractor.py | 5 +++--` (3 insertions, 2 deletions).
+- **Automated Tests (`tests/test_evaluation.py`)**:
+  - `test_pipeline_result_serialization`: verified lossless dictionary serialization/deserialization.
+  - `test_has_usable_text_layer`: verified text layer detection threshold on synthetic PDFs.
+  - `test_run_pipeline_on_file_missing_file`: verified `FILE_NOT_FOUND` error handling.
+  - `test_run_pipeline_on_file_success`: verified InvoiceData extraction, review flags, metadata, zero SQLite writes, and disk cleanup.
+  - `test_run_pipeline_on_file_app_error_cleanup`: verified error capture and guaranteed temporary storage cleanup on `AppError`.
+  - Test result: `5 passed in 0.64s` (all mocked, 0 real API calls).
+
+### Step A3: Ground Truth Management & Schema Validation
+- **Ground Truth Implementation (`evaluation/ground_truth.py`)**:
+  - Implemented `validate_ground_truth_dict(data)`:
+    - Validates mandatory keys (`doc_id`, `source_file`, `document_kind`, `_status`, `expected`).
+    - Validates document kind (`digital_pdf`, `scan`, `photo`).
+    - Validates status (`TODO`, `verified`).
+    - Enforces ISO 8601 calendar date validity (`YYYY-MM-DD`, rejecting invalid dates or calendar impossibilities like Feb 30).
+    - Enforces strict numeric types for monetary and tax fields (rejecting strings, objects, booleans).
+    - Supports `null` (not shown on doc) and `"IGNORE"` (skip scoring).
+    - Enforces line item structure and numeric amount validation.
+  - Implemented `cmd_templates()`:
+    - Scans `eval/data/` for document files without ground truth annotations.
+    - Generates template files with `_status: "TODO"`, all fields `null`, and reader instructions.
+    - Preserves existing annotations: never overwrites existing ground truth files.
+  - Implemented `cmd_check_gt()`:
+    - Scans `eval/ground_truth/*.json`, validates schemas and verified status, verifies existence of corresponding document in `eval/data/`.
+    - Returns clean summary of ready vs unready files and returns appropriate exit code.
+- **Reference & Example Annotations**:
+  - Copied `samples/7474.pdf` to `eval/data/7474.pdf`.
+  - Created verified annotation in `eval/ground_truth/reliance_7474.json` with exact values and fused-item IGNORE rules.
+  - Created synthetic reference annotation in `eval/ground_truth.example.json`.
+- **Automated Tests (`tests/test_evaluation.py`)**:
+  - Added unit tests for TODO status rejection, bad ISO date rejection, non-numeric type rejection, template non-overwrite preservation, and verified reliance_7474 validation.
+  - Test suite result: `10 passed in 1.12s` (all mocked, 0 real API calls).
+
+### Step A4: Realistic Image Degraded Variants
+- **Variant Generation Engine (`evaluation/variants.py`)**:
+  - Implemented `apply_degradation(img, variant)`:
+    - `lowres`: Proportional downscaling to 50% width and height using Pillow bilinear filtering.
+    - `jpeg35`: Controlled JPEG compression artifacts at quality 35.
+    - `rot3blur`: 3-degree counter-clockwise rotation with white background fill (`(255, 255, 255)`) and expanded bounding canvas, followed by `ImageFilter.GaussianBlur(radius=1.2)`.
+  - Implemented `generate_variants_for_pdf(doc_path, doc_id, out_dir)`:
+    - Renders every source page at 150 DPI into RGB image buffer.
+    - Builds an **image-only PDF** with PyMuPDF `insert_image` matching page count and dimensions.
+    - Guaranteed zero embedded digital text (`page.get_text() == ""` on all pages).
+    - Preserves deterministic byte outputs using `no_new_id=True, deflate=True`.
+  - Implemented `generate_variants_for_image(doc_path, doc_id, out_dir)`:
+    - Degrades and exports standalone image formats (`.jpg`).
+  - Implemented `cmd_variants()` CLI subcommand generating `eval/variants/<doc_id>__<variant>.(pdf|jpg)`.
+- **Verification on Reference Document**:
+  - Ran `python -m evaluation.cli variants` on `7474.pdf`:
+    - Generated `reliance_7474__lowres.pdf` (2 pages, 0 text chars).
+    - Generated `reliance_7474__jpeg35.pdf` (2 pages, 0 text chars).
+    - Generated `reliance_7474__rot3blur.pdf` (2 pages, 0 text chars).
+  - Verified `git check-ignore -v` ignores all generated variant files.
+- **Automated Tests (`tests/test_evaluation.py`)**:
+  - `test_variants_pdf_no_text_layer_and_same_page_count`: verifies output PDFs have 0 text chars and preserve page count.
+  - `test_variants_deterministic_output`: verifies two distinct runs on the same document produce byte-identical variant files.
+  - Test suite result: `12 passed in 2.29s` (all mocked, 0 real API calls).
+
+### Step A5: Evaluation Scoring Engine & Wilson Confidence Intervals
+- **Scoring Engine Implementation (`evaluation/scoring.py`)**:
+  - Implemented `normalize_text(text)`: casefolds, strips punctuation, collapses whitespace.
+  - Implemented `wilson_interval(k, n, confidence=0.95)`: mathematical Wilson binomial score interval calculation with closed-form bounds `[0.0, 1.0]`.
+  - Implemented `score_header_field(field_name, expected, predicted)`:
+    - Null-vs-null = correct.
+    - Expected null, predicted non-null = hallucination.
+    - Expected value, predicted null = miss.
+    - Numerical comparison (subtotal, tax, total, CGST, SGST, IGST, cess) with 0.01 tolerance (handles floating point rounding).
+    - Vendor exact (normalized exact) and near match (`difflib.SequenceMatcher.ratio >= 0.90`).
+    - Invoice number space-stripped equality; exact ISO date matching; uppercase currency matching; boolean tax inclusion matching.
+    - Skips fields marked `"IGNORE"`.
+  - Implemented `match_line_items(expected_items, predicted_items)`:
+    - Greedy matching on amount (tolerance 0.01) with description similarity tie-breaking.
+    - Computes item recall (`matched / expected`) and precision (`matched / predicted`, penalizing extras).
+    - Verifies matched item description (`ratio >= 0.80`), quantity (`tolerance 0.001`), and unit price (`tolerance 0.01`).
+  - Implemented `score_case(...)`:
+    - Evaluates critical correctness (`vendor_near + date + total`).
+    - Evaluates `all_header_correct` and `fully_correct` (all header fields and every item matched without error or extras).
+    - Classifies validator effectiveness: TP (error & flagged), FN (silent error: error & unflagged), FP (clean & flagged), TN (clean & unflagged).
+    - Aggregates fired review flag codes.
+  - Implemented `cmd_score()` CLI command to score raw extraction JSON files against ground truth annotations and output `eval/results/scores.json`.
+- **Automated Tests (`tests/test_evaluation.py`)**:
+  - `test_text_normalization`: verifies whitespace, punctuation, and casefolding.
+  - `test_wilson_interval_sanity_values`: verifies boundary values for k=0, k=n, k=n/2 against Wilson formula.
+  - `test_header_scoring_rules`: verifies null/hallucination/miss, numeric tolerance limits (0.01 passes, 0.02 fails), and vendor exact vs near matching.
+  - `test_line_item_matching_duplicates_and_tolerances`: verifies greedy disambiguation of duplicate amounts, recall, precision, and extra items penalty.
+  - `test_validator_effectiveness_confusion_matrix`: verifies TP, FN, FP, TN classification.
+  - Test suite result: `17 passed in 2.44s` (all mocked, 0 real API calls).
+
+### Step A6: Case Matrix Planning, Rate-Limit Pacing & Resumable Runner
+- **Case Matrix & Planning Engine (`evaluation/pipeline_runner.py`)**:
+  - Implemented `build_case_matrix(only_doc=None) -> list[EvalCase]`:
+    - Discovers all documents in `eval/data/`.
+    - Generates `<doc>__text` (only if embedded digital text layer >= 50 characters).
+    - Generates `<doc>__image` (clean rendered image path).
+    - Generates 3 degraded variant cases (`<doc>__lowres`, `<doc>__jpeg35`, `<doc>__rot3blur`) with mode `auto`.
+  - Implemented `cmd_plan(only_doc=None)`:
+    - Dry-run listing case matrix with per-case modes and estimated token footprints (~2,200 for text, ~4,000 for image/variants).
+    - Estimates overall runtime and total API calls against authorized 45-call budget.
+    - Zero real API calls made.
+- **Execution Engine, Pacing & Manifest (`evaluation/pipeline_runner.py`)**:
+  - Implemented `write_manifest(case_ids)`: exports `eval/results/manifest.json` recording date, git commit hash, model, seed, extraction mode, prompt SHA-256, and case inventory.
+  - Implemented `load_daily_usage(date)` and `update_daily_usage(date, tokens, calls)` tracking tokens in `eval/results/usage.json`.
+  - Implemented `cmd_run(limit, only, force, repeats)`:
+    - Resumable: skips already-completed cases present in `eval/results/raw/{case_id}.json` unless `--force`.
+    - Token budget guard: stops cleanly before exceeding `EVAL_DAILY_TOKEN_CAP` (default 150,000 tokens/day).
+    - Pacing sleep: enforces `max(10, tokens / 8000 * 60 + 5)` seconds between calls to respect Groq free-tier 8,000 tokens/min limit.
+    - Rate limit safety: cleanly halts on 429 rate limit wait > 65s or 3 consecutive errors.
+- **Automated Tests (`tests/test_evaluation.py`)**:
+  - `test_runner_writes_manifest`: verified manifest metadata, model, seed, and 64-char prompt SHA-256 hash.
+  - `test_runner_resumes_without_recalling_cached_cases`: verified cached cases in `raw/` are skipped on subsequent runs.
+  - `test_runner_stops_at_token_cap`: verified clean stop before exceeding `EVAL_DAILY_TOKEN_CAP`.
+  - Test suite result: `20 passed in 4.06s` (all mocked, 0 real API calls).
+
+### Step A7: Aggregate Reporting & Timing Comparison
+- **Aggregate Report Generator (`evaluation/report.py`)**:
+  - Implemented `generate_report_markdown(manifest, scored_cases, doc_kinds)`:
+    - Guaranteed privacy: strictly outputs aggregate metrics only (no vendor names, invoice numbers, amounts, or document filenames).
+    - Section 1: Setup & Environment (model, seed, commit, date, prompt SHA-256, document inventory by kind, case counts).
+    - Section 2: Header-field accuracy table across all paths (`text`, `image`, `lowres`, `jpeg35`, `rot3blur`, and `overall`) reported as `k/n (pct, Wilson 95% CI)`.
+    - Section 3: Line-item metrics (recall, precision, description accuracy, quantity accuracy, unit price accuracy).
+    - Section 4: Validator effectiveness table (TP, FN silent errors, FP false alarms, TN, recall, precision, and fired review flag distribution).
+    - Section 5: Efficiency, latency (mean & P95), tokens, and free-plan daily capacity (`200,000 / mean_tokens`).
+    - Section 6: Limitations (sample size, synthetic degradation perturbations, single human annotator, provider model/quota factors).
+  - Implemented `cmd_report()` CLI command writing directly to `eval/report/summary.md`.
+- **Timing Engine (`evaluation/report.py`)**:
+  - Created `eval/timing_template.csv` with columns `doc_id,method,seconds,errors_left,notes`.
+  - Implemented `cmd_timing(csv_path)` CLI command analyzing manual entry vs tool review times and computing mean seconds and time savings percentage.
+
+### Step A8: Comprehensive Mocked Evaluation Test Suite & Stage A Verification
+- **Automated Test Suite (`backend/tests/test_evaluation.py`)**:
+  - 22 table-driven, fully mocked unit tests:
+    - Pipeline result serialization / deserialization roundtrip.
+    - Embedded text layer detection threshold on synthetic PDFs.
+    - Pipeline runner missing file error handling.
+    - Pipeline runner successful extraction with mode override, review flags, zero DB writes, and storage cleanup.
+    - Pipeline runner error cleanup under `AppError`.
+    - Ground truth validation rejecting unverified `TODO` status, invalid date strings, calendar impossibilities (e.g. Feb 30), and non-numeric types.
+    - Ground truth template non-overwrite preservation.
+    - Ground truth validation on reference document `reliance_7474.json`.
+    - Variant generation verifying 0 digital text chars and preserved page count.
+    - Variant generation determinism verifying byte-identical outputs across runs.
+    - Text normalization with punctuation and whitespace collapsing.
+    - Wilson 95% confidence interval boundary sanity checks.
+    - Header field scoring rules (null-vs-null, hallucination, miss, tolerance edges 0.01 vs 0.02, vendor exact vs near).
+    - Greedy line-item matching with duplicate amount disambiguation and extra items penalty.
+    - Validator effectiveness confusion matrix (TP, FN silent errors, FP, TN).
+    - Manifest generation with valid SHA-256 prompt hash.
+    - Runner cached case skipping and resumability.
+    - Runner token budget cap enforcement.
+    - Report privacy verification (guaranteeing zero private vendor, invoice number, or amount strings).
+    - Timing command statistics calculation.
+  - Test result: **22 passed in 4.03s** (0 real API tokens consumed, 100% mocked).
+- **Verification Evidence**:
+  - `python -m evaluation.cli templates`: ran cleanly (0 created, 1 existing).
+  - `python -m evaluation.cli check-gt`: validated `reliance_7474.json` as verified and ready.
+  - `python -m evaluation.cli variants`: produced deterministic image-only PDFs for `7474.pdf` (lowres, jpeg35, rot3blur).
+  - `python -m evaluation.cli plan`: printed complete case matrix (5 cases, 18,200 estimated tokens, 0 API calls).
+  - `python -m evaluation.cli timing`: computed 76.4% time reduction on template data.
+  - `git check-ignore -v`: confirmed `eval/data/`, `eval/ground_truth/`, `eval/variants/`, and `eval/results/` are ignored.
+  - `git status`: clean of all private data or documents.
+
+
+
+
+
+
+
 
 

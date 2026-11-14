@@ -116,7 +116,7 @@ def images_to_base64_urls(images: list[bytes]) -> list[str]:
     return urls
 
 
-def extract_document(document_id: str) -> tuple[InvoiceData, ExtractionMeta]:
+def extract_document(document_id: str, mode_override: str | None = None) -> tuple[InvoiceData, ExtractionMeta]:
     """Run the full extraction pipeline for a preprocessed document.
 
     Orchestrates page selection, text-first mode determination, LLM extraction,
@@ -124,6 +124,7 @@ def extract_document(document_id: str) -> tuple[InvoiceData, ExtractionMeta]:
 
     Args:
         document_id: UUID of the already-preprocessed document.
+        mode_override: Optional override for EXTRACTION_MODE ('auto', 'text', 'image').
 
     Returns:
         Tuple of (extracted invoice data, extraction metadata).
@@ -165,7 +166,7 @@ def extract_document(document_id: str) -> tuple[InvoiceData, ExtractionMeta]:
     pdf_text = extract_pdf_text_for_pages(doc_dir, page_numbers)
     text_char_count = len(pdf_text) if pdf_text else 0
 
-    mode = settings.extraction_mode.lower()
+    mode = (mode_override or settings.extraction_mode).lower()
     if mode == "text" and text_char_count > 0:
         source = "text"
     elif mode == "image":

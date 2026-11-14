@@ -12,10 +12,12 @@ venv/
 .pytest_cache/
 
 # Storage & uploads
+/backend/storage/
 backend/storage/
-storage/
+/storage/
+/backend/data/
 backend/data/
-data/
+/data/
 *.db
 *.db-wal
 *.db-shm
@@ -32,3 +34,20 @@ Thumbs.db
 samples/*
 !samples/README.md
 
+# Evaluation data, ground truth, variants, results, and reports
+eval/data/*
+!eval/data/.gitkeep
+eval/ground_truth/*
+!eval/ground_truth/.gitkeep
+eval/variants/
+!eval/variants/
+eval/variants/*
+!eval/variants/.gitkeep
+eval/results/
+!eval/results/
+eval/results/*
+!eval/results/.gitkeep
+eval/report/*
+!eval/report/.gitkeep
+!eval/report/summary.md
+eval/timing.csv
