@@ -6,8 +6,13 @@ from typing import Optional, Sequence
 
 from evaluation.ground_truth import cmd_templates, cmd_check_gt
 from evaluation.variants import cmd_variants
-from evaluation.scoring import cmd_score
-from evaluation.report import cmd_report, cmd_timing
+from evaluation.scoring import cmd_score, cmd_diff
+from evaluation.report import (
+    cmd_report,
+    cmd_timing,
+    cmd_causes_template,
+    cmd_item_math_diag,
+)
 from evaluation.pipeline_runner import cmd_plan, cmd_run
 
 
@@ -46,6 +51,16 @@ def build_parser() -> argparse.ArgumentParser:
     # timing
     subparsers.add_parser("timing", help="Analyze manual vs reviewed timing comparison")
 
+    # diff
+    diff_parser = subparsers.add_parser("diff", help="Detailed field-by-field diff for a single evaluation case")
+    diff_parser.add_argument("--case", type=str, required=True, help="Case ID to inspect (e.g. inv01__text)")
+
+    # causes-template
+    subparsers.add_parser("causes-template", help="Generate error causes template for silent error cases")
+
+    # item-math-diag
+    subparsers.add_parser("item-math-diag", help="Print ITEM_MATH_MISMATCH diagnostic output to terminal")
+
     return parser
 
 
@@ -74,6 +89,12 @@ def main(args: Optional[Sequence[str]] = None) -> int:
         return cmd_report()
     elif parsed.command == "timing":
         return cmd_timing()
+    elif parsed.command == "diff":
+        return cmd_diff(case_id=parsed.case)
+    elif parsed.command == "causes-template":
+        return cmd_causes_template()
+    elif parsed.command == "item-math-diag":
+        return cmd_item_math_diag()
     else:
         parser.print_help()
         return 1
@@ -81,4 +102,3 @@ def main(args: Optional[Sequence[str]] = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

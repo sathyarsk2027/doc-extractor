@@ -1,5 +1,5 @@
 """Evaluation scoring functions, field-level matching, and Wilson interval metrics."""
-
+import json
 import difflib
 import math
 import re
@@ -93,6 +93,8 @@ class LineItemMatchResult:
     unit_price_correct: int
     has_discrepancy: bool
     wrong_item_notes: list[str] = field(default_factory=list)
+    unmatched_expected: list[dict[str, Any]] = field(default_factory=list)
+    unmatched_predicted: list[LineItem] = field(default_factory=list)
 
 
 @dataclass
@@ -207,6 +209,8 @@ def match_line_items(
     matched_pred_indices: set[int] = set()
     matched_pairs: list[tuple[dict[str, Any], LineItem]] = []
     wrong_notes: list[str] = []
+    unmatched_exp: list[dict[str, Any]] = []
+    unmatched_pred: list[LineItem] = []
 
     # Greedily match each expected item
     for e_idx, e_item in enumerate(expected_items):
@@ -241,11 +245,13 @@ def match_line_items(
             matched_pairs.append((e_item, predicted_items[best_p_idx]))
         else:
             wrong_notes.append(f"Expected item #{e_idx+1} unmatched (amount={e_amount})")
+            unmatched_exp.append(e_item)
 
     # Unmatched predicted items (extras)
     for p_idx, p_item in enumerate(predicted_items):
         if p_idx not in matched_pred_indices:
             wrong_notes.append(f"Extra predicted item #{p_idx+1} (amount={p_item.amount})")
+            unmatched_pred.append(p_item)
 
     matched_count = len(matched_pairs)
     recall = (matched_count / exp_count) if exp_count > 0 else 1.0
@@ -310,6 +316,8 @@ def match_line_items(
         unit_price_correct=unit_price_correct,
         has_discrepancy=has_discrepancy,
         wrong_item_notes=wrong_notes,
+        unmatched_expected=unmatched_exp,
+        unmatched_predicted=unmatched_pred,
     )
 
 
@@ -471,4 +479,102 @@ def cmd_score() -> int:
         json.dump(scored_cases, f, indent=2)
 
     print(f"Scoring complete. Scored {len(scored_cases)} cases. Saved to {scores_file.name}.")
+    return 0
+
+
+def cmd_diff(case_id: str) -> int:
+    """Print field-by-field diff between expected and predicted values for a single case."""
+    from evaluation.ground_truth import get_results_dir, get_gt_dir, load_ground_truth
+
+    raw_path = get_results_dir() / "raw" / f"{case_id}.json"
+    if not raw_path.is_file():
+        print(f"Error: Result file not found for case '{case_id}' at {raw_path}")
+        return 1
+
+    doc_id = case_id.split("__")[0]
+    gt_path = get_gt_dir() / f"{doc_id}.json"
+    if not gt_path.is_file():
+        # Fallback search
+        found_gt = None
+        for p in get_gt_dir().glob("*.json"):
+            if p.name != ".gitkeep":
+                try:
+                    data = load_ground_truth(p)
+                    if data.get("doc_id") == doc_id:
+                        found_gt = p
+                        break
+                except Exception:
+                    pass
+        if found_gt:
+            gt_path = found_gt
+        else:
+            print(f"Error: Ground truth file not found for doc '{doc_id}' in {get_gt_dir()}")
+            return 1
+
+    try:
+        raw_data = json.loads(raw_path.read_text(encoding="utf-8"))
+        gt_data = load_ground_truth(gt_path)
+    except Exception as exc:
+        print(f"Error reading JSON files: {exc}")
+        return 1
+
+    pred_data = raw_data.get("extraction")
+    prediction = InvoiceData.model_validate(pred_data) if pred_data else None
+    flags = raw_data.get("flags") or {}
+    needs_review = raw_data.get("needs_review") or False
+
+    case_res = score_case(doc_id, case_id, gt_data, prediction, flags, needs_review)
+
+    print("=" * 80)
+    print(f"Case Diff: {case_id} (Document: {doc_id})")
+    print("=" * 80)
+    print(f"Classification:   {case_res.classification}")
+    print(f"Needs Review:     {needs_review}")
+    flag_list = [f"{k} ({v.get('code', 'UNKNOWN')})" for k, v in flags.items()] if isinstance(flags, dict) else []
+    print(f"Fired Flags:      {', '.join(flag_list) if flag_list else 'None'}")
+    print(f"Critical Correct: {case_res.critical_correct}")
+    print(f"Fully Correct:    {case_res.fully_correct}")
+
+    print("\n--- Header Fields ---")
+    print(f"{'FIELD':<20} {'EXPECTED':<30} {'PREDICTED':<30} {'RESULT'}")
+    print("-" * 90)
+    for fld in HEADER_FIELDS:
+        if fld in case_res.header_scores:
+            s = case_res.header_scores[fld]
+            status_str = "✓ CORRECT" if s["correct"] else f"✗ WRONG ({s['status']})"
+            exp_str = str(s["expected"]) if s["expected"] is not None else "null"
+            pred_str = str(s["predicted"]) if s["predicted"] is not None else "null"
+            print(f"{fld:<20} {exp_str:<30} {pred_str:<30} {status_str}")
+
+    li = case_res.line_item_result
+    print("\n--- Line-Item Matching ---")
+    print(f"Expected count:   {li.expected_count}")
+    print(f"Predicted count:  {li.predicted_count}")
+    print(f"Matched count:    {li.matched_count}")
+    print(f"Item Recall:      {li.recall * 100:.1f}%")
+    print(f"Item Precision:   {li.precision * 100:.1f}%")
+
+    if li.unmatched_expected:
+        print(f"\nUnmatched Expected Items ({len(li.unmatched_expected)}):")
+        for idx, it in enumerate(li.unmatched_expected, 1):
+            desc = it.get("description", "N/A")
+            amt = it.get("amount", "N/A")
+            qty = it.get("quantity", "N/A")
+            up = it.get("unit_price", "N/A")
+            print(f"  {idx}. desc={desc!r}, amount={amt}, qty={qty}, unit_price={up}")
+    else:
+        print("\nUnmatched Expected Items: None")
+
+    if li.unmatched_predicted:
+        print(f"\nUnmatched Predicted Items ({len(li.unmatched_predicted)}):")
+        for idx, it in enumerate(li.unmatched_predicted, 1):
+            desc = it.description or "N/A"
+            amt = it.amount if it.amount is not None else "N/A"
+            qty = it.quantity if it.quantity is not None else "N/A"
+            up = it.unit_price if it.unit_price is not None else "N/A"
+            print(f"  {idx}. desc={desc!r}, amount={amt}, qty={qty}, unit_price={up}")
+    else:
+        print("\nUnmatched Predicted Items: None")
+
+    print("=" * 80)
     return 0

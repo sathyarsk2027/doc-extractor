@@ -17,6 +17,7 @@ from evaluation.ground_truth import (
     get_gt_dir,
     load_ground_truth,
     validate_ground_truth_dict,
+    sanity_check_ground_truth,
 )
 from evaluation.pipeline_runner import (
     PipelineResult,
@@ -709,6 +710,528 @@ def test_timing_command_empty_prints_no_timing_data_yet(tmp_path, capsys):
     assert ret == 0
     captured = capsys.readouterr()
     assert "No timing data yet" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# Tests: Ground Truth Sanity Checks (Warnings Only)
+# ---------------------------------------------------------------------------
+
+def test_sanity_check_line_item_sum_differs():
+    """(a) Warn when sum of line-item amounts differs from both subtotal and total by > 0.02."""
+    data_match_sub = {
+        "expected": {
+            "subtotal": 100.0,
+            "total": 118.0,
+            "date": "2026-11-01",
+            "invoice_number": "INV123",
+            "line_items": [{"amount": 100.0}],
+        }
+    }
+    assert not any("line_items.amount" in w for w in sanity_check_ground_truth(data_match_sub))
+
+    data_match_tot = {
+        "expected": {
+            "subtotal": 100.0,
+            "total": 118.0,
+            "date": "2026-11-01",
+            "invoice_number": "INV123",
+            "line_items": [{"amount": 118.0}],
+        }
+    }
+    assert not any("line_items.amount" in w for w in sanity_check_ground_truth(data_match_tot))
+
+    data_mismatch = {
+        "expected": {
+            "subtotal": 100.0,
+            "total": 118.0,
+            "date": "2026-11-01",
+            "invoice_number": "INV123",
+            "line_items": [{"amount": 50.0}],
+        }
+    }
+    warns = sanity_check_ground_truth(data_mismatch)
+    assert any("line_items.amount" in w for w in warns)
+    assert any("50.00" in w and "subtotal" in w and "total" in w for w in warns)
+
+
+def test_sanity_check_subtotal_tax_total_mismatch():
+    """(b) Warn when subtotal + tax differs from total by > 0.02 when prices_include_tax is not true."""
+    data_valid = {
+        "expected": {
+            "subtotal": 100.0,
+            "tax": 18.0,
+            "total": 118.0,
+            "prices_include_tax": False,
+            "date": "2026-11-01",
+            "invoice_number": "INV123",
+            "line_items": [{"amount": 100.0}],
+        }
+    }
+    assert not any("total: subtotal" in w for w in sanity_check_ground_truth(data_valid))
+
+    data_mismatch = {
+        "expected": {
+            "subtotal": 100.0,
+            "tax": 18.0,
+            "total": 125.0,
+            "prices_include_tax": False,
+            "date": "2026-11-01",
+            "invoice_number": "INV123",
+            "line_items": [{"amount": 100.0}],
+        }
+    }
+    warns = sanity_check_ground_truth(data_mismatch)
+    assert any("total: subtotal" in w for w in warns)
+
+    data_tax_incl = {
+        "expected": {
+            "subtotal": 100.0,
+            "tax": 18.0,
+            "total": 100.0,
+            "prices_include_tax": True,
+            "date": "2026-11-01",
+            "invoice_number": "INV123",
+            "line_items": [{"amount": 100.0}],
+        }
+    }
+    assert not any("total: subtotal" in w for w in sanity_check_ground_truth(data_tax_incl))
+
+
+def test_sanity_check_gst_components_mismatch():
+    """(c) Warn when cgst + sgst + igst + cess differs from tax by > 0.02."""
+    data_valid = {
+        "expected": {
+            "tax": 18.0,
+            "cgst": 9.0,
+            "sgst": 9.0,
+            "date": "2026-11-01",
+            "invoice_number": "INV123",
+            "line_items": [{"amount": 18.0}],
+        }
+    }
+    assert not any("tax:" in w and "cgst" in w for w in sanity_check_ground_truth(data_valid))
+
+    data_mismatch = {
+        "expected": {
+            "tax": 18.0,
+            "cgst": 9.0,
+            "sgst": 8.0,
+            "date": "2026-11-01",
+            "invoice_number": "INV123",
+            "line_items": [{"amount": 18.0}],
+        }
+    }
+    warns = sanity_check_ground_truth(data_mismatch)
+    assert any("tax:" in w and "cgst" in w for w in warns)
+
+
+def test_sanity_check_date_invalid_or_future():
+    """(d) Warn when date is invalid ISO format or lies in the future."""
+    from datetime import date as d_class
+    ref_today = d_class(2026, 11, 14)
+
+    data_past = {"expected": {"date": "2026-11-01", "line_items": [{"amount": 10}]}}
+    assert not any("date:" in w for w in sanity_check_ground_truth(data_past, today=ref_today))
+
+    data_future = {"expected": {"date": "2026-11-20", "line_items": [{"amount": 10}]}}
+    warns = sanity_check_ground_truth(data_future, today=ref_today)
+    assert any("date: '2026-11-20' lies in the future" in w for w in warns)
+
+    data_invalid = {"expected": {"date": "14/11/2026", "line_items": [{"amount": 10}]}}
+    warns_inv = sanity_check_ground_truth(data_invalid, today=ref_today)
+    assert any("date: '14/11/2026' is not a valid ISO date" in w for w in warns_inv)
+
+    data_none = {"expected": {"date": None, "line_items": [{"amount": 10}]}}
+    warns_none = sanity_check_ground_truth(data_none, today=ref_today)
+    assert any("date: 'None' is not a valid ISO date" in w for w in warns_none)
+
+
+def test_sanity_check_invoice_number_contains_spaces():
+    """(e) Warn when invoice_number contains spaces."""
+    data_spaces = {"expected": {"invoice_number": "INV 001 2026", "line_items": [{"amount": 10}], "date": "2026-11-01"}}
+    warns = sanity_check_ground_truth(data_spaces)
+    assert any("invoice_number: 'INV 001 2026' contains spaces" in w for w in warns)
+
+    data_no_spaces = {"expected": {"invoice_number": "INV-001-2026", "line_items": [{"amount": 10}], "date": "2026-11-01"}}
+    assert not any("invoice_number:" in w for w in sanity_check_ground_truth(data_no_spaces))
+
+
+def test_sanity_check_zero_line_items():
+    """(f) Warn when there are zero line items."""
+    data_zero = {"expected": {"line_items": [], "date": "2026-11-01", "invoice_number": "123"}}
+    warns = sanity_check_ground_truth(data_zero)
+    assert any("line_items: contains zero line items" in w for w in warns)
+
+    data_missing = {"expected": {"date": "2026-11-01", "invoice_number": "123"}}
+    warns_missing = sanity_check_ground_truth(data_missing)
+    assert any("line_items: contains zero line items" in w for w in warns_missing)
+
+
+def test_sanity_check_draft_notes_exists():
+    """(g) Warn when _draft_notes still exists."""
+    data_with_notes = {
+        "_draft_notes": "Needs review on shipping discount",
+        "expected": {"line_items": [{"amount": 10}], "date": "2026-11-01", "invoice_number": "123"},
+    }
+    warns = sanity_check_ground_truth(data_with_notes)
+    assert any("_draft_notes: draft notes field still exists" in w for w in warns)
+
+    data_without = {
+        "expected": {"line_items": [{"amount": 10}], "date": "2026-11-01", "invoice_number": "123"},
+    }
+    assert not any("_draft_notes:" in w for w in sanity_check_ground_truth(data_without))
+
+
+def test_cmd_check_gt_prints_sanity_warnings_without_changing_status(tmp_path, capsys, monkeypatch):
+    """cmd_check_gt prints warnings with field names and does not alter validation status."""
+    gt_dir = tmp_path / "ground_truth"
+    data_dir = tmp_path / "data"
+    gt_dir.mkdir()
+    data_dir.mkdir()
+
+    (data_dir / "inv.pdf").write_text("dummy", encoding="utf-8")
+
+    gt_content = {
+        "doc_id": "inv",
+        "source_file": "inv.pdf",
+        "document_kind": "digital_pdf",
+        "_status": "verified",
+        "_draft_notes": "Unverified vendor",
+        "expected": {
+            "vendor": "Acme",
+            "invoice_number": "INV 100",
+            "date": "2026-11-01",
+            "currency": "USD",
+            "subtotal": 100.0,
+            "taxable_amount": 100.0,
+            "cgst": None,
+            "sgst": None,
+            "igst": None,
+            "cess": None,
+            "tax": None,
+            "total": 100.0,
+            "prices_include_tax": False,
+            "line_items": [{"description": "Item", "quantity": 1, "unit_price": 100.0, "amount": 100.0}],
+        },
+    }
+    (gt_dir / "inv.json").write_text(json.dumps(gt_content), encoding="utf-8")
+
+    monkeypatch.setenv("EVAL_DIR", str(tmp_path))
+
+    ret = cmd_check_gt()
+    assert ret == 0
+
+    captured = capsys.readouterr().out
+    assert "✓ inv.json" in captured
+    assert "Sanity Check Warnings (1 file(s)):" in captured
+    assert "_draft_notes: draft notes field still exists" in captured
+    assert "invoice_number: 'INV 100' contains spaces" in captured
+
+
+def test_cmd_diff_prints_field_diff_and_unmatched_items(tmp_path, capsys, monkeypatch):
+    """cmd_diff prints field-by-field expected/predicted diff and line-item matching details."""
+    from evaluation.scoring import cmd_diff
+
+    gt_dir = tmp_path / "ground_truth"
+    raw_dir = tmp_path / "results" / "raw"
+    gt_dir.mkdir(parents=True)
+    raw_dir.mkdir(parents=True)
+
+    gt_data = {
+        "doc_id": "docX",
+        "expected": {
+            "vendor": "Acme Tools",
+            "invoice_number": "INV-100",
+            "total": 100.0,
+            "line_items": [
+                {"description": "Item 1", "quantity": 1, "unit_price": 50.0, "amount": 50.0},
+                {"description": "Item 2", "quantity": 1, "unit_price": 50.0, "amount": 50.0},
+            ],
+        },
+    }
+    (gt_dir / "docX.json").write_text(json.dumps(gt_data), encoding="utf-8")
+
+    raw_data = {
+        "extraction": {
+            "vendor": "Acme Tools",  # Correct
+            "invoice_number": "INV-100",  # Correct
+            "total": 90.0,  # Wrong
+            "line_items": [
+                {"description": "Item 1", "quantity": 1, "unit_price": 50.0, "amount": 50.0},  # Matches Item 1
+                {"description": "Item Extra", "quantity": 1, "unit_price": 40.0, "amount": 40.0},  # Extra
+            ],
+        },
+        "flags": {},
+        "needs_review": False,
+    }
+    (raw_dir / "docX__text.json").write_text(json.dumps(raw_data), encoding="utf-8")
+
+    monkeypatch.setenv("EVAL_DIR", str(tmp_path))
+
+    # Missing case returns 1
+    assert cmd_diff("nonexistent__text") == 1
+    err_out = capsys.readouterr().out
+    assert "Result file not found" in err_out
+
+    # Valid case returns 0 and prints full diff
+    ret = cmd_diff("docX__text")
+    assert ret == 0
+
+    out = capsys.readouterr().out
+    assert "Case Diff: docX__text (Document: docX)" in out
+    assert "vendor" in out and "✓ CORRECT" in out
+    assert "total" in out and "✗ WRONG" in out
+    assert "Expected count:   2" in out
+    assert "Predicted count:  2" in out
+    assert "Matched count:    1" in out
+    assert "Item Recall:      50.0%" in out
+    assert "Item Precision:   50.0%" in out
+    assert "Unmatched Expected Items (1):" in out
+    assert "Item 2" in out
+    assert "Unmatched Predicted Items (1):" in out
+    assert "Item Extra" in out
+
+
+# ---------------------------------------------------------------------------
+# Extended Report Views Tests (Task 10)
+# ---------------------------------------------------------------------------
+
+from evaluation.report import (
+    compute_document_bootstrap,
+    is_flag_only_on_ignore,
+    generate_report_markdown,
+    cmd_causes_template,
+)
+
+
+def test_bootstrap_is_deterministic():
+    """Bootstrap confidence intervals are deterministic for a given random seed."""
+    cases_by_doc = {
+        "doc1": [
+            {"critical_correct": True, "all_header_correct": True, "wrong_header_count": 0, "classification": "TN"},
+            {"critical_correct": True, "all_header_correct": False, "wrong_header_count": 1, "classification": "TP"},
+        ],
+        "doc2": [
+            {"critical_correct": False, "all_header_correct": False, "wrong_header_count": 3, "classification": "FN"},
+        ],
+        "doc3": [
+            {"critical_correct": True, "all_header_correct": True, "wrong_header_count": 0, "classification": "TN"},
+        ],
+    }
+
+    res1 = compute_document_bootstrap(cases_by_doc, seed=42, n_resamples=500)
+    res2 = compute_document_bootstrap(cases_by_doc, seed=42, n_resamples=500)
+
+    assert res1 == res2
+    assert res1["critical_correct"]["mean"] == res2["critical_correct"]["mean"]
+    assert res1["critical_correct"]["lower"] == res2["critical_correct"]["lower"]
+    assert res1["critical_correct"]["upper"] == res2["critical_correct"]["upper"]
+    assert res1["validator_recall"]["lower"] == res2["validator_recall"]["lower"]
+
+
+def test_paired_comparison_counts():
+    """Paired comparison accurately tallies text better / equal / worse based on wrong headers."""
+    manifest = {
+        "git_commit": "abc1234",
+        "git_version": {"short_hash": "abc1234", "dirty": False, "nearest_tag": "v1.0"},
+    }
+    scored_cases = [
+        # doc1: text has 0 wrong, image has 2 wrong -> text better
+        {"doc_id": "doc1", "case_id": "doc1__text", "case_type": "text", "document_kind": "digital_pdf", "wrong_header_count": 0, "field_results": {"critical_correct": True, "all_header_correct": True}, "classification": "TN", "li_metrics": {"li_recall": 1.0}},
+        {"doc_id": "doc1", "case_id": "doc1__image", "case_type": "image", "document_kind": "digital_pdf", "wrong_header_count": 2, "field_results": {"critical_correct": False, "all_header_correct": False}, "classification": "FN", "li_metrics": {"li_recall": 0.8}},
+        # doc2: text has 1 wrong, image has 1 wrong -> equal
+        {"doc_id": "doc2", "case_id": "doc2__text", "case_type": "text", "document_kind": "digital_pdf", "wrong_header_count": 1, "field_results": {"critical_correct": True, "all_header_correct": False}, "classification": "TN", "li_metrics": {"li_recall": 1.0}},
+        {"doc_id": "doc2", "case_id": "doc2__image", "case_type": "image", "document_kind": "digital_pdf", "wrong_header_count": 1, "field_results": {"critical_correct": True, "all_header_correct": False}, "classification": "TN", "li_metrics": {"li_recall": 1.0}},
+        # doc3: text has 3 wrong, image has 1 wrong -> text worse
+        {"doc_id": "doc3", "case_id": "doc3__text", "case_type": "text", "document_kind": "digital_pdf", "wrong_header_count": 3, "field_results": {"critical_correct": False, "all_header_correct": False}, "classification": "FN", "li_metrics": {"li_recall": 0.5}},
+        {"doc_id": "doc3", "case_id": "doc3__image", "case_type": "image", "document_kind": "digital_pdf", "wrong_header_count": 1, "field_results": {"critical_correct": True, "all_header_correct": False}, "classification": "TN", "li_metrics": {"li_recall": 1.0}},
+    ]
+    doc_kinds = {"digital_pdf": 3}
+
+    md = generate_report_markdown(manifest, scored_cases, doc_kinds)
+
+    assert "## 7. Paired Text vs Image Comparison (Digital PDFs Only, n=3)" in md
+    assert "| **Text Better** (fewer wrong header fields) | 1 / 3 | 33.3% |" in md
+    assert "| **Equal** (identical number of wrong header fields) | 1 / 3 | 33.3% |" in md
+    assert "| **Text Worse** (more wrong header fields) | 1 / 3 | 33.3% |" in md
+
+
+def test_auto_mode_case_selection():
+    """mode=auto selection routes digital PDFs to text and photos/scans to image."""
+    manifest = {
+        "git_commit": "abc1234",
+        "git_version": {"short_hash": "abc1234", "dirty": False, "nearest_tag": "v1.0"},
+    }
+    scored_cases = [
+        # doc1 (digital_pdf) has both text and image; auto should pick text
+        {"doc_id": "doc1", "case_id": "doc1__text", "case_type": "text", "document_kind": "digital_pdf", "field_results": {"critical_correct": True}, "classification": "TN", "wrong_header_count": 0},
+        {"doc_id": "doc1", "case_id": "doc1__image", "case_type": "image", "document_kind": "digital_pdf", "field_results": {"critical_correct": False}, "classification": "FN", "wrong_header_count": 2},
+        # doc2 (photo) has only image; auto should pick image
+        {"doc_id": "doc2", "case_id": "doc2__image", "case_type": "image", "document_kind": "photo", "field_results": {"critical_correct": True}, "classification": "TN", "wrong_header_count": 0},
+    ]
+    doc_kinds = {"digital_pdf": 1, "photo": 1}
+
+    md = generate_report_markdown(manifest, scored_cases, doc_kinds)
+
+    assert "## 8. As-Deployed (mode=auto) View (n=2)" in md
+    # Both selected cases have critical_correct=True, so 2/2
+    assert "| **`critical_correct`** | **2/2** | **100.0%** |" in md
+
+
+def test_ignore_only_flag_exclusion():
+    """Flags firing exclusively on IGNORE fields are identified and excluded."""
+    expected = {
+        "vendor": "Acme Tools",
+        "date": "2026-11-01",
+        "total": "IGNORE",
+        "line_items": [
+            {"description": "Item 1", "quantity": "IGNORE", "unit_price": "IGNORE", "amount": 100.0},
+            {"description": "Item 2", "quantity": 1.0, "unit_price": 50.0, "amount": 50.0},
+        ],
+    }
+
+    # Header flag on IGNORE field -> True
+    assert is_flag_only_on_ignore("total", {"code": "TOTAL_MISMATCH"}, expected) is True
+
+    # Header flag on non-IGNORE field -> False
+    assert is_flag_only_on_ignore("vendor", {"code": "REQUIRED_MISSING"}, expected) is False
+
+    # Line item flag on item 0 where quantity/unit_price is IGNORE -> True
+    assert is_flag_only_on_ignore("line_items[0].amount", {"code": "ITEM_MATH_MISMATCH"}, expected) is True
+
+    # Line item flag on item 1 where quantity/unit_price are NOT IGNORE -> False
+    assert is_flag_only_on_ignore("line_items[1].amount", {"code": "ITEM_MATH_MISMATCH"}, expected) is False
+
+
+def test_causes_template_and_cause_counting(tmp_path, monkeypatch):
+    """causes-template writes private error_causes.json and report tallies causes with unlabelled nulls."""
+    eval_dir = tmp_path / "eval"
+    results_dir = eval_dir / "results"
+    raw_dir = results_dir / "raw"
+    gt_dir = eval_dir / "ground_truth"
+    report_dir = eval_dir / "report"
+
+    results_dir.mkdir(parents=True)
+    raw_dir.mkdir(parents=True)
+    gt_dir.mkdir(parents=True)
+    report_dir.mkdir(parents=True)
+
+    monkeypatch.setenv("EVAL_DIR", str(eval_dir))
+
+    # Create synthetic doc with an error
+    gt_data = {
+        "doc_id": "testdoc",
+        "source_file": "testdoc.pdf",
+        "document_kind": "digital_pdf",
+        "_status": "verified",
+        "expected": {"vendor": "ExpectedVendor", "line_items": []},
+    }
+    (gt_dir / "testdoc.json").write_text(json.dumps(gt_data), encoding="utf-8")
+
+    # Raw result with wrong vendor and needs_review=False -> FN (silent error)
+    raw_data = {
+        "extraction": {"vendor": "WrongVendor", "line_items": []},
+        "flags": {},
+        "needs_review": False,
+        "meta": {"model": "m", "latency_ms": 100, "input_tokens": 10, "output_tokens": 10, "pages_sent": [1], "repaired": False, "source": "text"},
+        "error": None,
+    }
+    (raw_dir / "testdoc__text.json").write_text(json.dumps(raw_data), encoding="utf-8")
+
+    # Run causes-template
+    ret = cmd_causes_template()
+    assert ret == 0
+
+    causes_file = results_dir / "error_causes.json"
+    assert causes_file.is_file()
+    causes_content = json.loads(causes_file.read_text(encoding="utf-8"))
+    assert "testdoc__text" in causes_content
+    assert causes_content["testdoc__text"] is None
+
+    # Now label the cause and run report
+    causes_content["testdoc__text"] = "vendor_naming"
+    causes_file.write_text(json.dumps(causes_content), encoding="utf-8")
+
+    (results_dir / "manifest.json").write_text(json.dumps({"cases": ["testdoc__text"]}), encoding="utf-8")
+    ret_rep = cmd_report()
+    assert ret_rep == 0
+
+    summary_text = (report_dir / "summary.md").read_text(encoding="utf-8")
+    assert "## 12. Validator Analysis (Extended)" in summary_text
+    assert "| `vendor_naming` | 1 | 100.0% |" in summary_text
+    assert "| `unlabelled` | 0 | 0.0% |" in summary_text
+
+
+def test_report_contains_no_fixture_private_strings(tmp_path, monkeypatch):
+    """Extended report contains zero vendor names, invoice numbers, amounts, or filenames from fixtures."""
+    eval_dir = tmp_path / "eval"
+    results_dir = eval_dir / "results"
+    raw_dir = results_dir / "raw"
+    gt_dir = eval_dir / "ground_truth"
+    report_dir = eval_dir / "report"
+
+    results_dir.mkdir(parents=True)
+    raw_dir.mkdir(parents=True)
+    gt_dir.mkdir(parents=True)
+    report_dir.mkdir(parents=True)
+
+    monkeypatch.setenv("EVAL_DIR", str(eval_dir))
+
+    private_vendor = "TopSecretCorporationXYZ"
+    private_invoice_num = "INV-CONFIDENTIAL-8888"
+    private_amount = 998877.66
+    private_filename = "classified_invoice.pdf"
+
+    gt_data = {
+        "doc_id": "secret_doc",
+        "source_file": private_filename,
+        "document_kind": "digital_pdf",
+        "_status": "verified",
+        "expected": {
+            "vendor": private_vendor,
+            "invoice_number": private_invoice_num,
+            "date": "2026-11-05",
+            "currency": "USD",
+            "total": private_amount,
+            "line_items": [
+                {"description": "Item", "quantity": 1.0, "unit_price": private_amount, "amount": private_amount}
+            ],
+        },
+    }
+    (gt_dir / "secret_doc.json").write_text(json.dumps(gt_data), encoding="utf-8")
+
+    raw_data = {
+        "extraction": {
+            "vendor": private_vendor,
+            "invoice_number": private_invoice_num,
+            "date": "2026-11-05",
+            "currency": "USD",
+            "total": private_amount,
+            "line_items": [
+                {"description": "Item", "quantity": 1.0, "unit_price": private_amount, "amount": private_amount}
+            ],
+        },
+        "flags": {},
+        "needs_review": False,
+        "meta": {"model": "m", "latency_ms": 100, "input_tokens": 10, "output_tokens": 10, "pages_sent": [1], "repaired": False, "source": "text"},
+        "error": None,
+    }
+    (raw_dir / "secret_doc__text.json").write_text(json.dumps(raw_data), encoding="utf-8")
+
+    (results_dir / "manifest.json").write_text(json.dumps({"cases": ["secret_doc__text"]}), encoding="utf-8")
+
+    ret = cmd_report()
+    assert ret == 0
+
+    summary_text = (report_dir / "summary.md").read_text(encoding="utf-8")
+
+    # Assert ZERO privacy leaks across the entire markdown report
+    assert private_vendor not in summary_text
+    assert private_invoice_num not in summary_text
+    assert str(private_amount) not in summary_text
+    assert private_filename not in summary_text
+    assert "secret_doc" not in summary_text  # doc_id is also anonymized to Doc A
+
 
 
 

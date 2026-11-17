@@ -183,6 +183,45 @@ def get_git_commit() -> str:
         return "unknown"
 
 
+def get_git_version_info() -> dict[str, Any]:
+    """Retrieve git HEAD short hash, dirty status, and nearest tag.
+
+    Returns:
+        dict with keys: short_hash, dirty, nearest_tag
+    """
+    repo_root = str(Path(__file__).resolve().parent.parent.parent)
+    info: dict[str, Any] = {"short_hash": "unknown", "dirty": False, "nearest_tag": "none"}
+
+    try:
+        res = subprocess.run(
+            ["git", "-C", repo_root, "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, check=True,
+        )
+        info["short_hash"] = res.stdout.strip()
+    except Exception:
+        pass
+
+    try:
+        res = subprocess.run(
+            ["git", "-C", repo_root, "status", "--porcelain"],
+            capture_output=True, text=True, check=True,
+        )
+        info["dirty"] = len(res.stdout.strip()) > 0
+    except Exception:
+        pass
+
+    try:
+        res = subprocess.run(
+            ["git", "-C", repo_root, "describe", "--tags", "--abbrev=0"],
+            capture_output=True, text=True, check=True,
+        )
+        info["nearest_tag"] = res.stdout.strip()
+    except Exception:
+        info["nearest_tag"] = "none"
+
+    return info
+
+
 def get_prompt_sha256() -> str:
     """Retrieve SHA-256 hash of EXTRACTION_PROMPT."""
     try:
@@ -335,9 +374,11 @@ def write_manifest(case_ids: list[str]) -> Path:
     results_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = results_dir / "manifest.json"
 
+    git_ver = get_git_version_info()
     manifest_data = {
         "date": datetime.now(timezone.utc).isoformat(),
         "git_commit": get_git_commit(),
+        "git_version": git_ver,
         "model": settings.groq_model,
         "seed": settings.groq_seed,
         "default_extraction_mode": settings.extraction_mode,

@@ -4,7 +4,7 @@ import json
 import logging
 import os
 import re
-from datetime import datetime
+from datetime import datetime, date
 from pathlib import Path
 from typing import Any, Optional
 
@@ -143,6 +143,112 @@ def validate_ground_truth_dict(data: dict[str, Any]) -> tuple[bool, bool, list[s
     return is_valid, is_verified, errors
 
 
+def sanity_check_ground_truth(data: dict[str, Any], today: Optional[date] = None) -> list[str]:
+    """Run sanity checks on ground truth data and return warning messages.
+
+    Warnings only — does not alter validation status or modify any file.
+
+    Checks:
+      (a) sum of line-item amounts differs from both subtotal and total by > 0.02
+      (b) subtotal + tax differs from total by > 0.02 when all 3 present and prices_include_tax is not true
+      (c) cgst + sgst + igst + cess differs from tax by > 0.02 when those fields are present
+      (d) date is not a valid ISO date or lies in the future
+      (e) invoice_number contains spaces
+      (f) zero line items
+      (g) _draft_notes still exists
+    """
+    warnings: list[str] = []
+    expected = data.get("expected")
+    if not isinstance(expected, dict):
+        return warnings
+
+    # (a) sum of line-item amounts differs from both subtotal and total by more than 0.02
+    items = expected.get("line_items")
+    if isinstance(items, list) and items:
+        numeric_amounts = [
+            it.get("amount") for it in items
+            if isinstance(it, dict) and isinstance(it.get("amount"), (int, float)) and not isinstance(it.get("amount"), bool)
+        ]
+        if numeric_amounts:
+            item_sum = sum(numeric_amounts)
+            subtotal = expected.get("subtotal")
+            total = expected.get("total")
+
+            has_sub = isinstance(subtotal, (int, float)) and not isinstance(subtotal, bool)
+            has_tot = isinstance(total, (int, float)) and not isinstance(total, bool)
+
+            diff_sub = (abs(item_sum - subtotal) > 0.02) if has_sub else True
+            diff_tot = (abs(item_sum - total) > 0.02) if has_tot else True
+
+            if (has_sub or has_tot) and diff_sub and diff_tot:
+                sub_str = f"{subtotal:.2f}" if has_sub else "null"
+                tot_str = f"{total:.2f}" if has_tot else "null"
+                warnings.append(
+                    f"line_items.amount: sum of line-item amounts ({item_sum:.2f}) differs from both "
+                    f"subtotal ({sub_str}) and total ({tot_str}) by > 0.02"
+                )
+
+    # (b) subtotal + tax differs from total by more than 0.02 when all three are present and prices_include_tax is not true
+    subtotal = expected.get("subtotal")
+    tax = expected.get("tax")
+    total = expected.get("total")
+    prices_include_tax = expected.get("prices_include_tax")
+
+    has_sub = isinstance(subtotal, (int, float)) and not isinstance(subtotal, bool)
+    has_tax = isinstance(tax, (int, float)) and not isinstance(tax, bool)
+    has_tot = isinstance(total, (int, float)) and not isinstance(total, bool)
+
+    if has_sub and has_tax and has_tot and prices_include_tax is not True:
+        calc_total = subtotal + tax
+        if abs(calc_total - total) > 0.02:
+            warnings.append(
+                f"total: subtotal ({subtotal:.2f}) + tax ({tax:.2f}) = {calc_total:.2f} differs from total ({total:.2f}) by > 0.02 (prices_include_tax is not true)"
+            )
+
+    # (c) cgst + sgst + igst + cess differs from tax by more than 0.02 when those fields are present
+    gst_components = {}
+    for comp in ("cgst", "sgst", "igst", "cess"):
+        val = expected.get(comp)
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            gst_components[comp] = val
+
+    if has_tax and gst_components:
+        comp_sum = sum(gst_components.values())
+        if abs(comp_sum - tax) > 0.02:
+            comp_str = " + ".join(f"{k} ({v:.2f})" for k, v in gst_components.items())
+            warnings.append(
+                f"tax: {comp_str} = {comp_sum:.2f} differs from tax ({tax:.2f}) by > 0.02"
+            )
+
+    # (d) the date is not a valid ISO date or lies in the future
+    date_val = expected.get("date")
+    ref_today = today or date.today()
+    if not isinstance(date_val, str):
+        warnings.append(f"date: '{date_val}' is not a valid ISO date (expected YYYY-MM-DD)")
+    else:
+        try:
+            parsed_d = datetime.strptime(date_val, "%Y-%m-%d").date()
+            if parsed_d > ref_today:
+                warnings.append(f"date: '{date_val}' lies in the future (today is {ref_today.isoformat()})")
+        except ValueError:
+            warnings.append(f"date: '{date_val}' is not a valid ISO date (expected YYYY-MM-DD)")
+
+    # (e) invoice_number contains spaces
+    inv_num = expected.get("invoice_number")
+    if isinstance(inv_num, str) and " " in inv_num:
+        warnings.append(f"invoice_number: '{inv_num}' contains spaces")
+
+    # (f) there are zero line items
+    if not isinstance(items, list) or len(items) == 0:
+        warnings.append("line_items: contains zero line items")
+
+    # (g) _draft_notes still exists
+    if "_draft_notes" in data:
+        warnings.append("_draft_notes: draft notes field still exists")
+
+    return warnings
+
+
 def load_ground_truth(file_path: Path | str) -> dict[str, Any]:
     """Load and parse ground truth JSON file."""
     path = Path(file_path)
@@ -247,6 +353,7 @@ def cmd_check_gt() -> int:
 
     ready: list[str] = []
     unready: list[tuple[str, list[str]]] = []
+    file_warnings: list[tuple[str, list[str]]] = []
 
     for gt_path in sorted(gt_files):
         try:
@@ -256,6 +363,9 @@ def cmd_check_gt() -> int:
             continue
 
         is_valid, is_verified, errors = validate_ground_truth_dict(data)
+        warnings = sanity_check_ground_truth(data)
+        if warnings:
+            file_warnings.append((gt_path.name, warnings))
 
         # Check corresponding source file
         source_file = data.get("source_file")
@@ -284,6 +394,13 @@ def cmd_check_gt() -> int:
             print(f"  ✗ {name}:")
             for err in errs:
                 print(f"      - {err}")
+
+    if file_warnings:
+        print(f"\nSanity Check Warnings ({len(file_warnings)} file(s)):")
+        for name, warns in file_warnings:
+            print(f"  ⚠ {name}:")
+            for warn in warns:
+                print(f"      - {warn}")
 
     if unready:
         print(f"\nResult: NOT READY ({len(unready)} unverified or invalid file(s)).")
