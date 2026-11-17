@@ -1,15 +1,21 @@
 # AI Document Extractor — Evaluation Report
 
 ## 1. Setup & Environment
+
+### Run Manifest (Recorded When Cases Ran)
 - **Evaluation Date**: `2026-11-16T14:53:39.964982+00:00`
 - **Model**: `qwen/qwen3.8-27b` (Seed: `42`)
 - **Git Commit**: `349c3d4c9ef4577aaf58e2252808302c65a2d599`
-- **Git HEAD**: `132c495` (tag: `eval-v1`, working tree: dirty)
 - **Prompt SHA-256**: `1d06ec7147f6489dd80ac79f877fa0a9892ac98e743b848be54c761a2e1dd31f`
 - **Python Version**: `3.14.6`
 - **Default Extraction Mode**: `auto`
 - **Document Inventory**: 8 documents (digital_pdf: 6, photo: 2)
 - **Total Cases Evaluated**: 38 cases
+
+### Report Generation Environment
+- **Git HEAD**: `8776ff4`
+- **Nearest Tag**: `eval-v1`
+- **Working Tree**: `dirty` (excluding `eval/report/`)
 
 ---
 
@@ -43,7 +49,7 @@ All rates reported as `k/n (accuracy %, Wilson 95% CI [lower %, upper %])`:
 
 | Metric | Text Path | Clean Image | Lowres (50%) | JPEG Q35 | Rot3 + Blur | Overall |
 |---|---|---|---|---|---|---|
-| Item Recall (matched/expected) | 50.0% (n=6) | 81.2% (n=8) | 87.5% (n=8) | 68.8% (n=8) | 71.9% (n=8) | 73.0% (n=38) |
+| Item Recall (matched/expected, mean of per-case recalls (macro)) | 50.0% (n=6) | 81.2% (n=8) | 87.5% (n=8) | 68.8% (n=8) | 71.9% (n=8) | 73.0% (n=38) |
 | Item Precision (matched/predicted) | 50.0% (n=6) | 81.2% (n=8) | 87.5% (n=8) | 68.8% (n=8) | 71.9% (n=8) | 73.0% (n=38) |
 | Description Accuracy (among matched items, ratio >= 0.80) | 100.0% (n=6) | 93.8% (n=8) | 96.9% (n=8) | 96.9% (n=8) | 92.2% (n=8) | 95.7% (n=38) |
 | Quantity Accuracy (among matched items, diff <= 0.001) | 100.0% (n=6) | 100.0% (n=8) | 100.0% (n=8) | 100.0% (n=8) | 100.0% (n=8) | 100.0% (n=38) |
@@ -70,6 +76,21 @@ All rates reported as `k/n (accuracy %, Wilson 95% CI [lower %, upper %])`:
 | `NO_LINE_ITEMS` | 1 |
 | `LINE_SUM_MISMATCH` | 1 |
 
+### ITEM_MATH_MISMATCH Aggregate Breakdown
+Aggregate distribution across all 13 `ITEM_MATH_MISMATCH` review flags:
+
+| Ratio Bucket (`amount / (qty * price)`) | Flag Count | Share |
+|---|---|---|
+| `~1.05` | 0 | 0.0% |
+| `~1.12` | 0 | 0.0% |
+| `~1.18` | 8 | 61.5% |
+| `~1.28` | 0 | 0.0% |
+| `~0` | 4 | 30.8% |
+| `other` | 1 | 7.7% |
+
+- **Flagged Cases Scored True Positive (TP)**: 10 flags (76.9%)
+- **Flagged Cases Scored False Positive (FP)**: 3 flags (23.1%)
+
 ---
 
 ## 5. Latency, Token Usage & Capacity
@@ -85,7 +106,7 @@ All rates reported as `k/n (accuracy %, Wilson 95% CI [lower %, upper %])`:
 
 > [!NOTE]
 > Free tier capacity estimate is based on the 200,000 tokens/day Groq free quota ceiling and 8,000 tokens/minute rate limit.
-> Recorded latency represents overall wall-clock request duration; API-only latency cannot be separated from retry waits.
+> **Latency Caveat**: Recorded latency represents overall end-to-end wall-clock request duration; API-only execution time cannot be separated from retry or backoff waits if retries occurred. Token counts serve as the primary and most reliable metric for cross-path efficiency comparisons.
 
 ---
 
@@ -110,12 +131,16 @@ Direct pairwise comparison of the **Text Path** (`mode=text`) versus the **Clean
 | **Mean Total Tokens** | 2424 | 4270 | Text saves 43.2% tokens |
 | **Mean Latency** | 1680 ms | 13033 ms | Text is 7.8x faster |
 
+*(Note: Recorded latency reflects end-to-end wall-clock duration and cannot isolate retry waits; token counts provide the primary efficiency comparison.)*
+
 ### Per-Document Outcome (by Number of Wrong Header Fields)
 | Outcome | Document Count | Share |
 |---|---|---|
 | **Text Better** (fewer wrong header fields) | 3 / 6 | 50.0% |
 | **Equal** (identical number of wrong header fields) | 3 / 6 | 50.0% |
 | **Text Worse** (more wrong header fields) | 0 / 6 | 0.0% |
+
+- **Sign Test**: Text better: 3, Text worse: 0, Ties: 3 (exact one-sided p = 0.1250, N=3 non-tied pairs)
 
 ### Paired Per-Field Accuracy (k/6)
 | Field | Text Path | Clean Image | Difference |
@@ -170,7 +195,7 @@ Extraction accuracy for the operational configuration (`mode=auto`): routes digi
 
 Summary across all evaluated documents (documents ordered alphabetically by ID and assigned labels A–H; mapping preserved privately in `eval/results/doc_label_map.json`):
 
-| Document | Kind | Cases | Critical Fields Correct | Mean Wrong Header Fields | Line Items Matched / Expected | Flagged Cases |
+| Document | Kind | Cases | Critical Fields Correct | Mean Wrong Header Fields | Line Items Matched / Expected (pooled over items (micro)) | Flagged Cases |
 |---|---|---|---|---|---|---|
 | Doc A | `digital_pdf` | 5 | 5/5 (100.0%) | 2.60 | 6/10 (60.0%) | 3/5 |
 | Doc B | `digital_pdf` | 5 | 5/5 (100.0%) | 0.20 | 7/10 (70.0%) | 2/5 |
@@ -245,15 +270,22 @@ Root cause distribution across all 22 silent-error cases (from `eval/results/err
 
 | Error Cause Category | Case Count | Share | Description |
 |---|---|---|---|
-| `wrong_invoice` | 0 | 0.0% | Root cause category: `wrong_invoice` |
-| `vendor_naming` | 0 | 0.0% | Root cause category: `vendor_naming` |
-| `line_amount_definition` | 0 | 0.0% | Root cause category: `line_amount_definition` |
-| `read_error` | 0 | 0.0% | Root cause category: `read_error` |
-| `other` | 0 | 0.0% | Root cause category: `other` |
-| `unlabelled` | 22 | 100.0% | Root cause category: `unlabelled` |
+| `wrong_invoice` | 0 | 0.0% | Extracted data from a different document, reference invoice, or misidentified invoice entity. |
+| `vendor_naming` | 0 | 0.0% | Vendor entity discrepancy (legal name vs DBA/trade name or logo/letterhead interpretation). |
+| `line_amount_definition` | 0 | 0.0% | Discrepancy in line item price/amount conventions (pre-tax vs post-tax totals, discounts). |
+| `read_error` | 0 | 0.0% | Character-level OCR/vision misreads on low-resolution, blurred, or noisy document regions. |
+| `other` | 0 | 0.0% | Miscellaneous defects or edge-case extraction failures not covered by specific categories. |
+| `unlabelled` | 22 | 100.0% | Silent error cases awaiting manual root-cause taxonomy assignment in error_causes.json. |
 
 ---
 
 ## 13. Latency & Retry Accounting
 - **Measurement Scope**: The recorded latency figures reflect total end-to-end wall-clock time for the successful extraction call.
 - **Retry Isolation**: Raw evaluation outputs do not separately log retry attempts or rate-limit backoff sleeps. Therefore, API-only latency cannot be separated from retry overhead.
+- **Primary Efficiency Metric**: Because wall-clock latency is subject to external network jitter and possible retry backoffs, token counts serve as the primary basis for efficiency comparison between extraction paths.
+
+---
+
+## 14. Definitions
+- **`critical_correct`**: Case where vendor name achieves a near-match (`vendor` similarity ratio >= 0.80), and both `date` and `total` are correct (`vendor near-match + date + total`).
+- **Critical-Field Defect (used in Section 12(c))**: Case with an error in any of the four critical fields: `vendor`, `invoice_number`, `date`, or `total` (`any of vendor, invoice_number, date, total wrong`).

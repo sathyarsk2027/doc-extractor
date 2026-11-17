@@ -1233,6 +1233,201 @@ def test_report_contains_no_fixture_private_strings(tmp_path, monkeypatch):
     assert "secret_doc" not in summary_text  # doc_id is also anonymized to Doc A
 
 
+def test_line_item_recall_labels(tmp_path, monkeypatch):
+    """Line-item recall figures are clearly distinguished as macro in §3 and micro in §9."""
+    from evaluation.report import generate_report_markdown
+
+    manifest = {"date": "2026-11-17", "model": "mock", "seed": 42}
+    scored_cases = [
+        {
+            "case_id": "doc1__text",
+            "doc_id": "doc1",
+            "case_type": "text",
+            "field_results": {"vendor": True, "critical_correct": True, "all_header_correct": True, "fully_correct": True},
+            "li_metrics": {"li_recall": 0.5, "li_precision": 0.5, "li_desc_acc": 1.0, "li_qty_acc": 1.0, "li_price_acc": 1.0},
+            "classification": "TN",
+            "flag_codes": [],
+            "flags": {},
+            "needs_review": False,
+            "wrong_fields": [],
+            "wrong_header_count": 0,
+            "has_error": False,
+            "has_crit_wrong": False,
+            "critical_correct": True,
+            "all_header_correct": True,
+            "fully_correct": True,
+            "matched_item_count": 5,
+            "expected_item_count": 10,
+            "document_kind": "digital_pdf",
+            "expected": {},
+            "extraction": {"line_items": []},
+            "latency_ms": 100,
+            "input_tokens": 100,
+            "output_tokens": 50,
+        }
+    ]
+    md = generate_report_markdown(manifest, scored_cases, {"digital_pdf": 1})
+
+    assert "Item Recall (matched/expected, mean of per-case recalls (macro))" in md
+    assert "Line Items Matched / Expected (pooled over items (micro))" in md
+
+
+def test_section_12d_real_descriptions():
+    """Section 12(d) contains informative descriptions rather than placeholder text."""
+    from evaluation.report import generate_report_markdown, CAUSE_DESCRIPTIONS
+
+    manifest = {"date": "2026-11-17", "model": "mock", "seed": 42}
+    scored_cases = [
+        {
+            "case_id": "doc1__text",
+            "doc_id": "doc1",
+            "case_type": "text",
+            "field_results": {},
+            "li_metrics": {},
+            "classification": "FN",
+            "flag_codes": [],
+            "flags": {},
+            "needs_review": False,
+            "wrong_fields": ["vendor"],
+            "wrong_header_count": 1,
+            "has_error": True,
+            "has_crit_wrong": True,
+            "critical_correct": False,
+            "all_header_correct": False,
+            "fully_correct": False,
+            "matched_item_count": 0,
+            "expected_item_count": 1,
+            "document_kind": "digital_pdf",
+            "expected": {},
+            "extraction": {},
+            "latency_ms": 100,
+            "input_tokens": 100,
+            "output_tokens": 50,
+        }
+    ]
+    causes = {"doc1__text": "wrong_invoice"}
+    md = generate_report_markdown(manifest, scored_cases, {"digital_pdf": 1}, causes_data=causes)
+
+    assert "Root cause category:" not in md
+    assert CAUSE_DESCRIPTIONS["wrong_invoice"] in md
+    assert CAUSE_DESCRIPTIONS["unlabelled"] in md
+
+
+def test_definitions_section_present():
+    """Report includes Section 14 with required operational definitions."""
+    from evaluation.report import generate_report_markdown
+
+    manifest = {"date": "2026-11-17", "model": "mock", "seed": 42}
+    md = generate_report_markdown(manifest, [], {})
+
+    assert "## 14. Definitions" in md
+    assert "critical_correct" in md
+    assert "vendor near-match + date + total" in md
+    assert "Critical-Field Defect (used in Section 12(c))" in md
+    assert "any of vendor, invoice_number, date, total wrong" in md
+
+
+def test_latency_caveat_and_token_primacy():
+    """Report states retry wait caveat next to tables and notes token counts as primary comparison."""
+    from evaluation.report import generate_report_markdown
+
+    manifest = {"date": "2026-11-17", "model": "mock", "seed": 42}
+    md = generate_report_markdown(manifest, [], {})
+
+    assert "Latency Caveat" in md
+    assert "Token counts serve as the primary and most reliable metric for cross-path efficiency comparisons." in md
+    assert "token counts serve as the primary basis for efficiency comparison between extraction paths." in md
+
+
+def test_sign_test_computation_and_report_integration():
+    """Exact one-sided sign test calculates exact binomial probability and integrates into §7."""
+    from evaluation.report import compute_sign_test_onesided_p, generate_report_markdown
+
+    # Exact binomial one-sided p-values:
+    # 3 better, 0 worse -> 0.5^3 = 0.125
+    assert compute_sign_test_onesided_p(3, 0) == 0.125
+    # 4 better, 0 worse -> 0.5^4 = 0.0625
+    assert compute_sign_test_onesided_p(4, 0) == 0.0625
+    # 0 non-tied pairs -> 1.0
+    assert compute_sign_test_onesided_p(0, 0) == 1.0
+
+    manifest = {"date": "2026-11-17", "model": "mock", "seed": 42}
+    case_t = {
+        "case_id": "doc1__text", "doc_id": "doc1", "case_type": "text",
+        "field_results": {"vendor": True, "critical_correct": True, "all_header_correct": True, "fully_correct": True},
+        "li_metrics": {"li_recall": 1.0}, "classification": "TN", "flag_codes": [], "flags": {},
+        "needs_review": False, "wrong_fields": [], "wrong_header_count": 0, "has_error": False,
+        "has_crit_wrong": False, "critical_correct": True, "all_header_correct": True, "fully_correct": True,
+        "matched_item_count": 1, "expected_item_count": 1, "document_kind": "digital_pdf", "expected": {},
+        "extraction": {}, "latency_ms": 100, "input_tokens": 100, "output_tokens": 50,
+    }
+    case_i = dict(case_t, case_id="doc1__image", case_type="image", wrong_header_count=1)
+    md = generate_report_markdown(manifest, [case_t, case_i], {"digital_pdf": 1})
+
+    assert "- **Sign Test**:" in md
+    assert "exact one-sided p = 0.5000" in md or "exact one-sided p =" in md
+
+
+def test_item_math_mismatch_bucketing_and_diagnostics(capsys, monkeypatch, tmp_path):
+    """ITEM_MATH_MISMATCH aggregates correctly bucket ratios and classifications."""
+    from evaluation.report import (
+        bucket_item_math_ratio,
+        extract_item_math_stats,
+        cmd_item_math_diag,
+    )
+
+    assert bucket_item_math_ratio(0.0) == "~0"
+    assert bucket_item_math_ratio(1.05) == "~1.05"
+    assert bucket_item_math_ratio(1.12) == "~1.12"
+    assert bucket_item_math_ratio(1.18) == "~1.18"
+    assert bucket_item_math_ratio(1.28) == "~1.28"
+    assert bucket_item_math_ratio(0.5) == "other"
+    assert bucket_item_math_ratio(None) == "other"
+
+    cases = [
+        {
+            "case_id": "c1",
+            "classification": "TP",
+            "flags": {"line_items[0].amount": {"code": "ITEM_MATH_MISMATCH"}},
+            "extraction": {"line_items": [{"description": "Item 1", "quantity": 1.0, "unit_price": 100.0, "amount": 118.0}]},
+        },
+        {
+            "case_id": "c2",
+            "classification": "FP",
+            "flags": {"line_items[0].amount": {"code": "ITEM_MATH_MISMATCH"}},
+            "extraction": {"line_items": [{"description": "Item 2", "quantity": 1.0, "unit_price": 100.0, "amount": 0.0}]},
+        },
+    ]
+
+    stats = extract_item_math_stats(cases)
+    assert stats["total_flags"] == 2
+    assert stats["tp_count"] == 1
+    assert stats["fp_count"] == 1
+    assert stats["ratio_buckets"]["~1.18"] == 1
+    assert stats["ratio_buckets"]["~0"] == 1
+
+    # Verify cmd_item_math_diag prints aggregate table without PII
+    eval_dir = tmp_path / "eval"
+    results_dir = eval_dir / "results"
+    raw_dir = results_dir / "raw"
+    gt_dir = eval_dir / "ground_truth"
+    raw_dir.mkdir(parents=True)
+    gt_dir.mkdir(parents=True)
+
+    monkeypatch.setenv("EVAL_DIR", str(eval_dir))
+    (raw_dir / "c1__image.json").write_text(json.dumps(cases[0]), encoding="utf-8")
+    (gt_dir / "c1.json").write_text(json.dumps({"doc_id": "c1", "expected": {"total": 999.99}}), encoding="utf-8")
+
+    ret = cmd_item_math_diag()
+    assert ret == 0
+    out = capsys.readouterr().out
+    assert "ITEM_MATH_MISMATCH Aggregate Diagnostics (Terminal Only)" in out
+    assert "Ratio Buckets (amount / (quantity * unit_price)):" in out
+    assert "~1.18" in out
+    assert "999.99" not in out  # No leak of amounts or vendor names
+
+
+
 
 
 

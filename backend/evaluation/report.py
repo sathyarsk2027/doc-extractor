@@ -8,6 +8,7 @@ import random
 import re
 import statistics
 import string
+import subprocess
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Optional
@@ -34,6 +35,142 @@ ALLOWED_CAUSES = [
     "read_error",
     "other",
 ]
+
+CAUSE_DESCRIPTIONS = {
+    "wrong_invoice": "Extracted data from a different document, reference invoice, or misidentified invoice entity.",
+    "vendor_naming": "Vendor entity discrepancy (legal name vs DBA/trade name or logo/letterhead interpretation).",
+    "line_amount_definition": "Discrepancy in line item price/amount conventions (pre-tax vs post-tax totals, discounts).",
+    "read_error": "Character-level OCR/vision misreads on low-resolution, blurred, or noisy document regions.",
+    "other": "Miscellaneous defects or edge-case extraction failures not covered by specific categories.",
+    "unlabelled": "Silent error cases awaiting manual root-cause taxonomy assignment in error_causes.json.",
+}
+
+
+def bucket_item_math_ratio(ratio: Optional[float]) -> str:
+    """Bucket ratio = amount / (quantity * unit_price) into standard GST tax buckets."""
+    if ratio is None:
+        return "other"
+    if abs(ratio - 0.0) <= 0.01:
+        return "~0"
+    elif abs(ratio - 1.05) <= 0.02:
+        return "~1.05"
+    elif abs(ratio - 1.12) <= 0.02:
+        return "~1.12"
+    elif abs(ratio - 1.18) <= 0.02:
+        return "~1.18"
+    elif abs(ratio - 1.28) <= 0.02:
+        return "~1.28"
+    else:
+        return "other"
+
+
+def extract_item_math_stats(scored_cases: list[dict[str, Any]]) -> dict[str, Any]:
+    """Compute aggregate counts for ITEM_MATH_MISMATCH bucketed by ratio and TP/FP."""
+    ratio_buckets = {"~1.05": 0, "~1.12": 0, "~1.18": 0, "~1.28": 0, "~0": 0, "other": 0}
+    tp_count = 0
+    fp_count = 0
+    total_flags = 0
+
+    for c in scored_cases:
+        flags = c.get("flags", {})
+        classification = c.get("classification", "UNKNOWN")
+        extraction = c.get("extraction") or {}
+        line_items = extraction.get("line_items") or []
+
+        for f_k, f_v in flags.items():
+            if f_v.get("code") == "ITEM_MATH_MISMATCH":
+                total_flags += 1
+                if classification == "TP":
+                    tp_count += 1
+                elif classification == "FP":
+                    fp_count += 1
+
+                m = re.search(r"line_items\[(\d+)\]", f_k)
+                ratio = None
+                if m and line_items:
+                    idx = int(m.group(1))
+                    if 0 <= idx < len(line_items):
+                        item = line_items[idx]
+                        qty = item.get("quantity")
+                        up = item.get("unit_price")
+                        amt = item.get("amount")
+                        if qty is not None and up is not None and (qty * up) != 0 and amt is not None:
+                            ratio = amt / (qty * up)
+                        elif amt == 0.0 or (amt is not None and abs(amt) <= 0.01):
+                            ratio = 0.0
+
+                b = bucket_item_math_ratio(ratio)
+                ratio_buckets[b] += 1
+
+    return {
+        "total_flags": total_flags,
+        "ratio_buckets": ratio_buckets,
+        "tp_count": tp_count,
+        "fp_count": fp_count,
+    }
+
+
+def compute_sign_test_onesided_p(better: int, worse: int) -> float:
+    """Compute exact one-sided p-value for sign test (testing if better > worse).
+
+    Discards ties per standard sign test methodology.
+    """
+    n = better + worse
+    if n == 0:
+        return 1.0
+    return sum(math.comb(n, j) * (0.5 ** n) for j in range(better, n + 1))
+
+
+def get_report_git_info(exclude_dir: str = "eval/report") -> dict[str, Any]:
+    """Retrieve git HEAD short hash, dirty status, and nearest tag at report generation time.
+
+    Excludes files inside exclude_dir (e.g. eval/report) when determining whether
+    the working tree is dirty.
+    """
+    repo_root = str(Path(__file__).resolve().parent.parent.parent)
+    info: dict[str, Any] = {"short_hash": "unknown", "nearest_tag": "none", "dirty": False}
+
+    try:
+        res = subprocess.run(
+            ["git", "-C", repo_root, "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        info["short_hash"] = res.stdout.strip()
+    except Exception:
+        pass
+
+    try:
+        res = subprocess.run(
+            ["git", "-C", repo_root, "describe", "--tags", "--always", "--abbrev=0"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        info["nearest_tag"] = res.stdout.strip()
+    except Exception:
+        pass
+
+    try:
+        res = subprocess.run(
+            ["git", "-C", repo_root, "status", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        lines = [line.strip() for line in res.stdout.splitlines() if line.strip()]
+        dirty_files = []
+        for line in lines:
+            path_part = line[3:].strip()
+            norm_path = path_part.replace("\\", "/")
+            if not norm_path.startswith(exclude_dir.rstrip("/") + "/"):
+                dirty_files.append(norm_path)
+        info["dirty"] = len(dirty_files) > 0
+    except Exception:
+        pass
+
+    return info
 
 
 def format_rate(k: int, n: int) -> str:
@@ -160,6 +297,7 @@ def generate_report_markdown(
     scored_cases: list[dict[str, Any]],
     doc_kinds: dict[str, int],
     causes_data: Optional[dict[str, Optional[str]]] = None,
+    report_git: Optional[dict[str, Any]] = None,
 ) -> str:
     """Generate aggregate markdown summary without personal data."""
     # Partition cases by type
@@ -175,28 +313,33 @@ def generate_report_markdown(
     # 1. Setup Section
     doc_kind_str = ", ".join(f"{k}: {v}" for k, v in sorted(doc_kinds.items()))
 
-    # Versioning details
-    git_ver = manifest.get("git_version")
-    if not git_ver or not isinstance(git_ver, dict):
-        git_ver = get_git_version_info()
-    short_hash = git_ver.get("short_hash", str(manifest.get("git_commit", "N/A"))[:7])
-    dirty_val = git_ver.get("dirty", False)
+    # Versioning details at report generation time
+    if report_git is None:
+        report_git = get_report_git_info()
+    short_hash = report_git.get("short_hash", "unknown")
+    nearest_tag = report_git.get("nearest_tag", "none")
+    dirty_val = report_git.get("dirty", False)
     dirty_str = "dirty" if dirty_val else "clean"
-    nearest_tag = git_ver.get("nearest_tag", "none")
 
     lines = [
         "# AI Document Extractor — Evaluation Report",
         "",
         "## 1. Setup & Environment",
+        "",
+        "### Run Manifest (Recorded When Cases Ran)",
         f"- **Evaluation Date**: `{manifest.get('date', 'N/A')}`",
         f"- **Model**: `{manifest.get('model', 'N/A')}` (Seed: `{manifest.get('seed', 'N/A')}`)",
         f"- **Git Commit**: `{manifest.get('git_commit', 'N/A')}`",
-        f"- **Git HEAD**: `{short_hash}` (tag: `{nearest_tag}`, working tree: {dirty_str})",
         f"- **Prompt SHA-256**: `{manifest.get('prompt_sha256', 'N/A')}`",
         f"- **Python Version**: `{manifest.get('python_version', 'N/A')}`",
         f"- **Default Extraction Mode**: `{manifest.get('default_extraction_mode', 'auto')}`",
         f"- **Document Inventory**: {sum(doc_kinds.values())} documents ({doc_kind_str})",
         f"- **Total Cases Evaluated**: {n_total} cases",
+        "",
+        "### Report Generation Environment",
+        f"- **Git HEAD**: `{short_hash}`",
+        f"- **Nearest Tag**: `{nearest_tag}`",
+        f"- **Working Tree**: `{dirty_str}` (excluding `eval/report/`)",
         "",
         "---",
         "",
@@ -246,7 +389,7 @@ def generate_report_markdown(
     ])
 
     li_metrics = [
-        ("Item Recall (matched/expected)", "li_recall"),
+        ("Item Recall (matched/expected, mean of per-case recalls (macro))", "li_recall"),
         ("Item Precision (matched/predicted)", "li_precision"),
         ("Description Accuracy (among matched items, ratio >= 0.80)", "li_desc_acc"),
         ("Quantity Accuracy (among matched items, diff <= 0.001)", "li_qty_acc"),
@@ -318,6 +461,34 @@ def generate_report_markdown(
     else:
         lines.append("*(No review flags were raised during this evaluation.)*")
 
+    # Aggregate ITEM_MATH_MISMATCH breakdown
+    math_stats = extract_item_math_stats(all_cases)
+    tot_math = math_stats["total_flags"]
+    if tot_math > 0:
+        b_counts = math_stats["ratio_buckets"]
+        tp_m = math_stats["tp_count"]
+        fp_m = math_stats["fp_count"]
+        tp_share = (tp_m / tot_math * 100.0) if tot_math > 0 else 0.0
+        fp_share = (fp_m / tot_math * 100.0) if tot_math > 0 else 0.0
+
+        lines.extend([
+            "",
+            "### ITEM_MATH_MISMATCH Aggregate Breakdown",
+            f"Aggregate distribution across all {tot_math} `ITEM_MATH_MISMATCH` review flags:",
+            "",
+            "| Ratio Bucket (`amount / (qty * price)`) | Flag Count | Share |",
+            "|---|---|---|",
+            f"| `~1.05` | {b_counts['~1.05']} | {b_counts['~1.05']/tot_math*100:.1f}% |",
+            f"| `~1.12` | {b_counts['~1.12']} | {b_counts['~1.12']/tot_math*100:.1f}% |",
+            f"| `~1.18` | {b_counts['~1.18']} | {b_counts['~1.18']/tot_math*100:.1f}% |",
+            f"| `~1.28` | {b_counts['~1.28']} | {b_counts['~1.28']/tot_math*100:.1f}% |",
+            f"| `~0` | {b_counts['~0']} | {b_counts['~0']/tot_math*100:.1f}% |",
+            f"| `other` | {b_counts['other']} | {b_counts['other']/tot_math*100:.1f}% |",
+            "",
+            f"- **Flagged Cases Scored True Positive (TP)**: {tp_m} flags ({tp_share:.1f}%)",
+            f"- **Flagged Cases Scored False Positive (FP)**: {fp_m} flags ({fp_share:.1f}%)",
+        ])
+
     # 5. Efficiency & Capacity Section
     lines.extend([
         "",
@@ -353,7 +524,7 @@ def generate_report_markdown(
         "",
         "> [!NOTE]",
         "> Free tier capacity estimate is based on the 200,000 tokens/day Groq free quota ceiling and 8,000 tokens/minute rate limit.",
-        "> Recorded latency represents overall wall-clock request duration; API-only latency cannot be separated from retry waits.",
+        "> **Latency Caveat**: Recorded latency represents overall end-to-end wall-clock request duration; API-only execution time cannot be separated from retry or backoff waits if retries occurred. Token counts serve as the primary and most reliable metric for cross-path efficiency comparisons.",
         "",
         "---",
         "",
@@ -452,6 +623,8 @@ def generate_report_markdown(
         mean_lat_i = sum(lat_i) / len(lat_i) if lat_i else 0.0
         lat_speedup = (mean_lat_i / mean_lat_t) if mean_lat_t > 0 else 1.0
         lines.append(f"| **Mean Latency** | {mean_lat_t:.0f} ms | {mean_lat_i:.0f} ms | Text is {lat_speedup:.1f}x faster |")
+        lines.append("")
+        lines.append("*(Note: Recorded latency reflects end-to-end wall-clock duration and cannot isolate retry waits; token counts provide the primary efficiency comparison.)*")
 
         # Per-document outcome
         text_better = 0
@@ -467,6 +640,9 @@ def generate_report_markdown(
             else:
                 text_worse += 1
 
+        p_sign = compute_sign_test_onesided_p(text_better, text_worse)
+        n_pairs = text_better + text_worse
+
         lines.extend([
             "",
             "### Per-Document Outcome (by Number of Wrong Header Fields)",
@@ -475,6 +651,8 @@ def generate_report_markdown(
             f"| **Text Better** (fewer wrong header fields) | {text_better} / {n_pdf} | {text_better/n_pdf*100:.1f}% |",
             f"| **Equal** (identical number of wrong header fields) | {text_equal} / {n_pdf} | {text_equal/n_pdf*100:.1f}% |",
             f"| **Text Worse** (more wrong header fields) | {text_worse} / {n_pdf} | {text_worse/n_pdf*100:.1f}% |",
+            "",
+            f"- **Sign Test**: Text better: {text_better}, Text worse: {text_worse}, Ties: {text_equal} (exact one-sided p = {p_sign:.4f}, N={n_pairs} non-tied pairs)",
             "",
             "### Paired Per-Field Accuracy (k/6)",
             "| Field | Text Path | Clean Image | Difference |",
@@ -539,7 +717,7 @@ def generate_report_markdown(
         "",
         "Summary across all evaluated documents (documents ordered alphabetically by ID and assigned labels A–H; mapping preserved privately in `eval/results/doc_label_map.json`):",
         "",
-        "| Document | Kind | Cases | Critical Fields Correct | Mean Wrong Header Fields | Line Items Matched / Expected | Flagged Cases |",
+        "| Document | Kind | Cases | Critical Fields Correct | Mean Wrong Header Fields | Line Items Matched / Expected (pooled over items (micro)) | Flagged Cases |",
         "|---|---|---|---|---|---|---|",
     ])
 
@@ -755,7 +933,8 @@ def generate_report_markdown(
     for cause_name in ALLOWED_CAUSES + ["unlabelled"]:
         cnt = cause_counter.get(cause_name, 0)
         share = (cnt / len(fn_cases_all) * 100.0) if fn_cases_all else 0.0
-        lines.append(f"| `{cause_name}` | {cnt} | {share:.1f}% | Root cause category: `{cause_name}` |")
+        desc = CAUSE_DESCRIPTIONS.get(cause_name, f"Root cause: {cause_name}")
+        lines.append(f"| `{cause_name}` | {cnt} | {share:.1f}% | {desc} |")
 
     # -------------------------------------------------------------------------
     # 13. Latency & Retry Accounting
@@ -767,6 +946,13 @@ def generate_report_markdown(
         "## 13. Latency & Retry Accounting",
         "- **Measurement Scope**: The recorded latency figures reflect total end-to-end wall-clock time for the successful extraction call.",
         "- **Retry Isolation**: Raw evaluation outputs do not separately log retry attempts or rate-limit backoff sleeps. Therefore, API-only latency cannot be separated from retry overhead.",
+        "- **Primary Efficiency Metric**: Because wall-clock latency is subject to external network jitter and possible retry backoffs, token counts serve as the primary basis for efficiency comparison between extraction paths.",
+        "",
+        "---",
+        "",
+        "## 14. Definitions",
+        "- **`critical_correct`**: Case where vendor name achieves a near-match (`vendor` similarity ratio >= 0.80), and both `date` and `total` are correct (`vendor near-match + date + total`).",
+        "- **Critical-Field Defect (used in Section 12(c))**: Case with an error in any of the four critical fields: `vendor`, `invoice_number`, `date`, or `total` (`any of vendor, invoice_number, date, total wrong`).",
         "",
     ])
 
@@ -926,12 +1112,14 @@ def cmd_report() -> int:
             "expected_item_count": li_res.expected_count,
             "document_kind": gt.get("document_kind", "unknown"),
             "expected": exp_dict,
+            "extraction": raw_data.get("extraction"),
             "latency_ms": meta_dict.get("latency_ms", 0),
             "input_tokens": meta_dict.get("input_tokens", 0),
             "output_tokens": meta_dict.get("output_tokens", 0),
         })
 
-    markdown = generate_report_markdown(manifest, scored_cases, doc_kinds, causes_data=causes_data)
+    report_git = get_report_git_info()
+    markdown = generate_report_markdown(manifest, scored_cases, doc_kinds, causes_data=causes_data, report_git=report_git)
 
     out_file = report_dir / "summary.md"
     out_file.write_text(markdown, encoding="utf-8")
@@ -968,7 +1156,10 @@ def cmd_causes_template() -> int:
                 raw_data = json.loads(rf.read_text(encoding="utf-8"))
             except Exception:
                 continue
-            pred = InvoiceData.model_validate(raw_data.get("extraction")) if raw_data.get("extraction") else None
+            try:
+                pred = InvoiceData.model_validate(raw_data.get("extraction")) if raw_data.get("extraction") else None
+            except Exception:
+                pred = None
             res = score_case(doc_id, case_id, gt, pred, raw_data.get("flags", {}), raw_data.get("needs_review", False))
             if res.classification == "FN":
                 fn_cases.append(case_id)
@@ -990,7 +1181,7 @@ def cmd_causes_template() -> int:
 
 
 def cmd_item_math_diag() -> int:
-    """Print ITEM_MATH_MISMATCH diagnostic to terminal only (never in summary.md)."""
+    """Print ITEM_MATH_MISMATCH aggregate counts to terminal only (never individual invoice data)."""
     results_dir = get_results_dir()
     raw_dir = results_dir / "raw"
     gt_dir = get_gt_dir()
@@ -1000,11 +1191,10 @@ def cmd_item_math_diag() -> int:
         return 1
 
     case_files = sorted(raw_dir.glob("*.json"))
-    found_any = False
-
-    print("=" * 80)
-    print("ITEM_MATH_MISMATCH Diagnostic Output (Terminal Only)")
-    print("=" * 80)
+    ratio_buckets = {"~1.05": 0, "~1.12": 0, "~1.18": 0, "~1.28": 0, "~0": 0, "other": 0}
+    tp_count = 0
+    fp_count = 0
+    total_flags = 0
 
     for cf in case_files:
         case_id = cf.stem
@@ -1019,39 +1209,64 @@ def cmd_item_math_diag() -> int:
         if not math_flags:
             continue
 
-        found_any = True
+        # Score case to determine TP vs FP
         gt_file = gt_dir / f"{doc_id}.json"
-        prices_include_tax = None
+        is_tp = False
         if gt_file.is_file():
             gt = load_ground_truth(gt_file)
-            prices_include_tax = gt.get("expected", {}).get("prices_include_tax")
-
-        print(f"\nCase ID: {case_id}")
-        print(f"  Ground Truth prices_include_tax: {prices_include_tax}")
+            try:
+                pred = InvoiceData.model_validate(raw_data.get("extraction")) if raw_data.get("extraction") else None
+            except Exception:
+                pred = None
+            score_res = score_case(
+                doc_id, case_id, gt, pred, raw_data.get("flags", {}), raw_data.get("needs_review", False)
+            )
+            is_tp = score_res.classification == "TP"
 
         pred = raw_data.get("extraction") or {}
         line_items = pred.get("line_items") or []
 
-        for flag_k, flag_v in math_flags.items():
+        for flag_k in math_flags.keys():
+            total_flags += 1
+            if is_tp:
+                tp_count += 1
+            else:
+                fp_count += 1
+
             m = re.search(r"line_items\[(\d+)\]", flag_k)
-            if m:
+            ratio = None
+            if m and line_items:
                 idx = int(m.group(1))
-                if idx < len(line_items):
+                if 0 <= idx < len(line_items):
                     item = line_items[idx]
                     qty = item.get("quantity")
                     up = item.get("unit_price")
                     amt = item.get("amount")
-                    ratio_str = "N/A"
                     if qty is not None and up is not None and (qty * up) != 0 and amt is not None:
-                        ratio = round(amt / (qty * up), 3)
-                        ratio_str = f"{ratio:.3f}"
-                    up_str = f"{up:.2f}" if up is not None else "null"
-                    amt_str = f"{amt:.2f}" if amt is not None else "null"
-                    print(f"  Flagged Item #{idx+1}: quantity={qty}, unit_price={up_str}, amount={amt_str}, ratio={ratio_str}")
+                        ratio = amt / (qty * up)
+                    elif amt == 0.0 or (amt is not None and abs(amt) <= 0.01):
+                        ratio = 0.0
 
-    print("\n" + "=" * 80)
-    if not found_any:
-        print("No cases encountered with ITEM_MATH_MISMATCH flag.")
+            b = bucket_item_math_ratio(ratio)
+            ratio_buckets[b] += 1
+
+    print("=" * 80)
+    print("ITEM_MATH_MISMATCH Aggregate Diagnostics (Terminal Only)")
+    print("=" * 80)
+    print(f"Total ITEM_MATH_MISMATCH flags: {total_flags}\n")
+    print("Ratio Buckets (amount / (quantity * unit_price)):")
+    for b_name in ["~1.05", "~1.12", "~1.18", "~1.28", "~0", "other"]:
+        cnt = ratio_buckets[b_name]
+        share = (cnt / total_flags * 100.0) if total_flags > 0 else 0.0
+        print(f"  {b_name:<6}: {cnt:>2} ({share:.1f}%)")
+
+    print("\nCase Classification Distribution:")
+    tp_share = (tp_count / total_flags * 100.0) if total_flags > 0 else 0.0
+    fp_share = (fp_count / total_flags * 100.0) if total_flags > 0 else 0.0
+    print(f"  True Positive (TP) cases:  {tp_count:>2} ({tp_share:.1f}%)")
+    print(f"  False Positive (FP) cases: {fp_count:>2} ({fp_share:.1f}%)")
+    print("=" * 80)
+
     return 0
 
 
