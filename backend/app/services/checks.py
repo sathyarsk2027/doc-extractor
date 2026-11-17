@@ -4,7 +4,25 @@ import re
 from datetime import date, datetime, timedelta
 from typing import Any
 
+from app.config import features_for
 from app.schemas import InvoiceData
+
+
+GST_SLAB_MULTIPLIERS = [1.05, 1.12, 1.18, 1.28]
+
+
+def is_gst_slab_ratio(
+    amount: float,
+    calc_amount: float,
+    slabs: list[float] | None = None,
+    tolerance: float = 0.02,
+) -> bool:
+    """Return True if amount / calc_amount is within tolerance of any GST slab multiplier."""
+    if calc_amount == 0:
+        return False
+    ratio = amount / calc_amount
+    target_slabs = slabs if slabs is not None else GST_SLAB_MULTIPLIERS
+    return any(abs(ratio - slab) <= tolerance for slab in target_slabs)
 
 
 def get_tolerance(base: float | None) -> float:
@@ -28,13 +46,21 @@ def exceeds_tolerance(diff: float, base: float | None) -> bool:
     return round(abs(diff), 4) > get_tolerance(base)
 
 
-def run_checks(invoice: InvoiceData) -> dict[str, dict[str, str]]:
+def run_checks(
+    invoice: InvoiceData,
+    text_content: str | None = None,
+    source: str = "image",
+    gst_slabs: list[float] | None = None,
+    extra_flags: dict[str, Any] | None = None,
+    version: str | None = None,
+) -> dict[str, dict[str, str]]:
     """Run pure validation checks on extracted InvoiceData.
 
     Returns:
         Dictionary mapping field names to flag descriptors:
         {"total": {"code": "TOTAL_MISMATCH", "message": "...", "severity": "error"}, ...}
     """
+    feat = features_for(version)
     flags: dict[str, dict[str, str]] = {}
 
     def _set_flag(field: str, code: str, message: str, severity: str) -> None:
@@ -167,6 +193,9 @@ def run_checks(invoice: InvoiceData) -> dict[str, dict[str, str]]:
             calc_amount = item.quantity * item.unit_price
             diff = calc_amount - item.amount
             if exceeds_tolerance(diff, item.amount):
+                # Under v2, do not fire if amount / (quantity * unit_price) matches a GST slab multiplier (+/-0.02)
+                if feat.tax_aware_item_math and is_gst_slab_ratio(item.amount, calc_amount, slabs=gst_slabs):
+                    continue
                 _set_flag(
                     f"line_items[{idx}].amount",
                     "ITEM_MATH_MISMATCH",
@@ -193,5 +222,46 @@ def run_checks(invoice: InvoiceData) -> dict[str, dict[str, str]]:
                 f"Line item amount is negative ({item.amount:.2f}).",
                 "warning",
             )
+
+    # 9. FIELD_NOT_IN_TEXT (warning):
+    # Under v2, when source == "text", warn for vendor or invoice_number if not found in PDF text
+    if feat.text_grounding_check and source == "text" and text_content is not None and text_content.strip():
+        norm_text = "".join(text_content.casefold().split())
+        text_tokens = set(re.findall(r"\w+", text_content.casefold()))
+
+        if invoice.vendor and invoice.vendor.strip():
+            vendor_str = invoice.vendor.strip()
+            norm_vendor = "".join(vendor_str.casefold().split())
+            matched = False
+            if norm_vendor in norm_text:
+                matched = True
+            else:
+                vendor_tokens = re.findall(r"\w+", vendor_str.casefold())
+                if vendor_tokens:
+                    overlap = sum(1 for t in vendor_tokens if t in text_tokens) / len(vendor_tokens)
+                    if overlap >= 0.9:
+                        matched = True
+            if not matched:
+                _set_flag(
+                    "vendor",
+                    "FIELD_NOT_IN_TEXT",
+                    f"Vendor '{vendor_str}' was not found in PDF text.",
+                    "warning",
+                )
+
+        if invoice.invoice_number and str(invoice.invoice_number).strip():
+            inv_str = str(invoice.invoice_number).strip()
+            norm_inv = "".join(inv_str.casefold().split())
+            if norm_inv not in norm_text:
+                _set_flag(
+                    "invoice_number",
+                    "FIELD_NOT_IN_TEXT",
+                    f"Invoice number '{inv_str}' was not found in PDF text.",
+                    "warning",
+                )
+
+    if extra_flags:
+        for k, v in extra_flags.items():
+            flags[k] = v
 
     return flags

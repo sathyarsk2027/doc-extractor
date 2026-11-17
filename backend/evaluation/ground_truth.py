@@ -50,11 +50,15 @@ def get_eval_dir() -> Path:
     return Path(__file__).resolve().parent.parent.parent / "eval"
 
 
-def get_data_dir() -> Path:
+def get_data_dir(dataset: str = "dev") -> Path:
+    if dataset == "holdout":
+        return get_eval_dir() / "holdout" / "data"
     return get_eval_dir() / "data"
 
 
-def get_gt_dir() -> Path:
+def get_gt_dir(dataset: str = "dev") -> Path:
+    if dataset == "holdout":
+        return get_eval_dir() / "holdout" / "ground_truth"
     return get_eval_dir() / "ground_truth"
 
 
@@ -62,8 +66,10 @@ def get_variants_dir() -> Path:
     return get_eval_dir() / "variants"
 
 
-def get_results_dir() -> Path:
-    return get_eval_dir() / "results"
+def get_results_dir(label: str = "v1") -> Path:
+    if label == "v1":
+        return get_eval_dir() / "results"
+    return get_eval_dir() / "results" / label
 
 
 def get_report_dir() -> Path:
@@ -256,10 +262,10 @@ def load_ground_truth(file_path: Path | str) -> dict[str, Any]:
         return json.load(f)
 
 
-def cmd_templates() -> int:
-    """Generate ground truth templates for unannotated documents in eval/data/."""
-    data_dir = get_data_dir()
-    gt_dir = get_gt_dir()
+def cmd_templates(dataset: str = "dev") -> int:
+    """Generate ground truth templates for unannotated documents in data dir."""
+    data_dir = get_data_dir(dataset)
+    gt_dir = get_gt_dir(dataset)
 
     data_dir.mkdir(parents=True, exist_ok=True)
     gt_dir.mkdir(parents=True, exist_ok=True)
@@ -337,10 +343,10 @@ def cmd_templates() -> int:
     return 0
 
 
-def cmd_check_gt() -> int:
+def cmd_check_gt(dataset: str = "dev") -> int:
     """Validate ground truth files for syntax, schema, and verified status."""
-    gt_dir = get_gt_dir()
-    data_dir = get_data_dir()
+    gt_dir = get_gt_dir(dataset)
+    data_dir = get_data_dir(dataset)
 
     if not gt_dir.exists():
         print(f"Ground truth directory does not exist: {gt_dir}")

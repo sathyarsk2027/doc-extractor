@@ -415,13 +415,13 @@ def score_case(
     )
 
 
-def cmd_score() -> int:
+def cmd_score(label: str = "v1", dataset: str = "dev") -> int:
     """Score raw extraction results against verified ground truth."""
     from evaluation.ground_truth import get_results_dir, get_gt_dir, load_ground_truth
 
-    results_dir = get_results_dir()
+    results_dir = get_results_dir(label)
     raw_dir = results_dir / "raw"
-    gt_dir = get_gt_dir()
+    gt_dir = get_gt_dir(dataset)
 
     if not raw_dir.exists():
         print(f"No results found in {raw_dir}. Run evaluation cases first via 'cli run'.")

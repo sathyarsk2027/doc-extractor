@@ -1427,6 +1427,394 @@ def test_item_math_mismatch_bucketing_and_diagnostics(capsys, monkeypatch, tmp_p
     assert "999.99" not in out  # No leak of amounts or vendor names
 
 
+# ---------------------------------------------------------------------------
+# Pipeline v2 & Comparison Tooling Tests
+# ---------------------------------------------------------------------------
+
+def test_prompt_v1_and_v2_hashes_and_selection():
+    """PROMPT_V1 hash remains exact; PROMPT_V2 includes specific additions; selection works."""
+    import hashlib
+    from app.services.groq_extractor import PROMPT_V1, PROMPT_V2, get_extraction_prompt
+
+    # V1 exact reproducible hash
+    v1_hash = hashlib.sha256(PROMPT_V1.encode("utf-8")).hexdigest()
+    assert v1_hash == "1d06ec7147f6489dd80ac79f877fa0a9892ac98e743b848be54c761a2e1dd31f"
+
+    # V2 additions
+    assert "amount = the line total printed in the right-most amount column" in PROMPT_V2
+    assert "vendor = the legal name of the company that issues the invoice (the seller)" in PROMPT_V2
+    assert "Never compute either" in PROMPT_V2
+
+    # Selection helper
+    assert get_extraction_prompt("v1") == PROMPT_V1
+    assert get_extraction_prompt("v2") == PROMPT_V2
+
+
+def test_table_aware_pdf_text_extraction(tmp_path):
+    """Synthetic PDF with small table renders pipe-separated rows in reading order."""
+    import pymupdf
+    from app.services.extractor import extract_page_text_with_tables
+
+    doc = pymupdf.open()
+    page = doc.new_page(width=300, height=300)
+
+    # Top title
+    page.insert_text(pymupdf.Point(40, 30), "INVOICE HEADER")
+
+    # Draw small 2x2 table grid lines
+    shape = page.new_shape()
+    shape.draw_line(pymupdf.Point(40, 50), pymupdf.Point(240, 50))
+    shape.draw_line(pymupdf.Point(40, 80), pymupdf.Point(240, 80))
+    shape.draw_line(pymupdf.Point(40, 110), pymupdf.Point(240, 110))
+    shape.draw_line(pymupdf.Point(40, 50), pymupdf.Point(40, 110))
+    shape.draw_line(pymupdf.Point(140, 50), pymupdf.Point(140, 110))
+    shape.draw_line(pymupdf.Point(240, 50), pymupdf.Point(240, 110))
+    shape.finish()
+    shape.commit()
+
+    # Table cells
+    page.insert_text(pymupdf.Point(50, 70), "ItemDesc")
+    page.insert_text(pymupdf.Point(150, 70), "LineTotal")
+    page.insert_text(pymupdf.Point(50, 100), "WidgetA")
+    page.insert_text(pymupdf.Point(150, 100), "45.00")
+
+    # Bottom footer text
+    page.insert_text(pymupdf.Point(40, 160), "THANK YOU FOR YOUR BUSINESS")
+
+    extracted = extract_page_text_with_tables(page)
+    doc.close()
+
+    assert "INVOICE HEADER" in extracted
+    assert "ItemDesc" in extracted
+    assert "WidgetA" in extracted
+    assert "THANK YOU FOR YOUR BUSINESS" in extracted
+    # Verify pipe separation occurs for detected table rows
+    assert "|" in extracted
+
+
+def test_multi_invoice_detection():
+    """Multi-invoice detection groups consecutive pages, selects max pages (ties: first), and flags."""
+    from app.services.extractor import detect_multi_invoices
+
+    # Case 1: 2 distinct invoice numbers across pages
+    pages = [
+        "Header text\nInvoice No: INV-100\nItems...",
+        "Continuation page without label\nMore items...",
+        "Second Invoice\nInvoice Number: INV-200\nItems...",
+    ]
+    pages_sel, flag = detect_multi_invoices(pages)
+    assert pages_sel == [1, 2]  # Group 1 has 2 pages vs Group 2 has 1 page
+    assert flag is not None
+    assert flag["code"] == "MULTIPLE_INVOICES_SUSPECTED"
+    assert "pages 1-2" in flag["message"]
+    assert "page 3" in flag["message"]
+
+    # Case 2: Ties break to first group
+    pages_tie = [
+        "Invoice No: INV-AAA\nPage 1",
+        "Invoice No: INV-BBB\nPage 2",
+    ]
+    pages_sel_tie, flag_tie = detect_multi_invoices(pages_tie)
+    assert pages_sel_tie == [1]  # Both have 1 page; first chosen
+    assert flag_tie is not None
+    assert flag_tie["code"] == "MULTIPLE_INVOICES_SUSPECTED"
+
+    # Case 3: Same invoice number on all pages -> no flag
+    pages_single = [
+        "Tax Invoice# INV-001\nPage 1",
+        "Invoice Number: INV-001\nPage 2",
+    ]
+    pages_none, flag_none = detect_multi_invoices(pages_single)
+    assert pages_none is None
+    assert flag_none is None
+
+
+def test_holdout_dataset_and_cases_plan(tmp_path, monkeypatch):
+    """Holdout dataset contains only text and image cases (no degraded variants); --cases filters properly."""
+    import pymupdf
+    from evaluation.pipeline_runner import build_case_matrix, cmd_plan
+
+    eval_dir = tmp_path / "eval"
+    data_dir = eval_dir / "data"
+    gt_dir = eval_dir / "ground_truth"
+    holdout_data = eval_dir / "holdout" / "data"
+    holdout_gt = eval_dir / "holdout" / "ground_truth"
+
+    for d in (data_dir, gt_dir, holdout_data, holdout_gt):
+        d.mkdir(parents=True)
+
+    monkeypatch.setenv("EVAL_DIR", str(eval_dir))
+
+    # Create dummy PDF in holdout data
+    doc = pymupdf.open()
+    p = doc.new_page()
+    p.insert_text((50, 50), "Sample text content " * 10)  # > 50 chars for text layer
+    pdf_path = holdout_data / "holdout_doc.pdf"
+    doc.save(str(pdf_path))
+    doc.close()
+
+    # Ground truth
+    (holdout_gt / "holdout_doc.json").write_text(json.dumps({
+        "doc_id": "holdout_doc",
+        "source_file": "holdout_doc.pdf",
+        "document_kind": "digital_pdf",
+        "_status": "verified",
+        "expected": {"vendor": "Holdout Inc", "total": 100.0, "date": "2026-11-05"},
+    }), encoding="utf-8")
+
+    cases_holdout = build_case_matrix(dataset="holdout")
+    case_types = [c.case_type for c in cases_holdout]
+    # Holdout has text and image ONLY (no lowres, jpeg35, rot3blur)
+    assert sorted(case_types) == ["image", "text"]
+    assert all(c.case_type in ("text", "image") for c in cases_holdout)
+
+    # Filter with cases_filter
+    cases_text_only = build_case_matrix(dataset="holdout", cases_filter=["text"])
+    assert len(cases_text_only) == 1
+    assert cases_text_only[0].case_type == "text"
+
+
+def test_compare_command_and_aggregates_only(tmp_path, monkeypatch):
+    """cmd_compare generates aggregate-only report with per-case-type tables, sign test, dev set note."""
+    from evaluation.report import cmd_compare
+
+    eval_dir = tmp_path / "eval"
+    res_m1 = eval_dir / "results" / "m1" / "raw"
+    res_m2 = eval_dir / "results" / "m2" / "raw"
+    gt_dir = eval_dir / "ground_truth"
+    report_dir = eval_dir / "report"
+
+    for d in (res_m1, res_m2, gt_dir, report_dir):
+        d.mkdir(parents=True)
+
+    monkeypatch.setenv("EVAL_DIR", str(eval_dir))
+
+    # Manifests
+    (eval_dir / "results" / "m1" / "manifest.json").write_text(
+        json.dumps({"pipeline_version": "v1", "model": "mock-m1", "prompt_sha256": "aaaa" * 8}),
+        encoding="utf-8",
+    )
+    (eval_dir / "results" / "m2" / "manifest.json").write_text(
+        json.dumps({"pipeline_version": "v2", "model": "mock-m2", "prompt_sha256": "bbbb" * 8}),
+        encoding="utf-8",
+    )
+
+    # Ground truth (contains real amounts, vendor names, invoice numbers)
+    secret_vendor = "Confidential Vendor XYZ 999"
+    secret_inv = "SECRET-INV-8888"
+    secret_amount = "777666.55"
+    (gt_dir / "doc1.json").write_text(json.dumps({
+        "doc_id": "doc1",
+        "source_file": "doc1.pdf",
+        "document_kind": "digital_pdf",
+        "_status": "verified",
+        "expected": {
+            "vendor": secret_vendor,
+            "invoice_number": secret_inv,
+            "date": "2026-11-05",
+            "total": float(secret_amount),
+        },
+    }), encoding="utf-8")
+
+    # M1 result: wrong vendor
+    (res_m1 / "doc1__text.json").write_text(json.dumps({
+        "extraction": {"vendor": "Wrong Vendor", "invoice_number": secret_inv, "date": "2026-11-05", "total": float(secret_amount)},
+        "flags": {},
+        "needs_review": False,
+        "meta": {"input_tokens": 100, "output_tokens": 50},
+    }), encoding="utf-8")
+
+    # M2 result: correct vendor
+    (res_m2 / "doc1__text.json").write_text(json.dumps({
+        "extraction": {"vendor": secret_vendor, "invoice_number": secret_inv, "date": "2026-11-05", "total": float(secret_amount)},
+        "flags": {},
+        "needs_review": False,
+        "meta": {"input_tokens": 110, "output_tokens": 55},
+    }), encoding="utf-8")
+
+    ret = cmd_compare(label_a="m1", label_b="m2", dataset="dev")
+    assert ret == 0
+
+    comp_report = (report_dir / "m1_vs_m2.md").read_text(encoding="utf-8")
+
+    # Required sections
+    assert "# Pipeline Evaluation Comparison: m1 vs m2" in comp_report
+    assert "Overall Performance Comparison" in comp_report
+    assert "Performance by Case Type" in comp_report
+    assert "Per-Document Comparison & Sign Test" in comp_report
+    assert "The development dataset was used to identify weaknesses" in comp_report
+
+    # Aggregates only check: ensure secret vendor, secret invoice number, amount, and filenames never leak
+    assert secret_vendor not in comp_report
+    assert secret_inv not in comp_report
+    assert secret_amount not in comp_report
+    assert "doc1.pdf" not in comp_report
+
+
+def test_v1_vs_v2_five_behaviour_differences(tmp_path, monkeypatch):
+    """For identical synthetic inputs, v1 and v2 differ exactly in the 5 specified behaviours."""
+    import hashlib
+    import uuid
+    import pymupdf
+    from unittest.mock import patch
+    from app.schemas import InvoiceData, LineItem, ExtractionMeta
+    from app.services.checks import run_checks
+    from app.services.groq_extractor import PROMPT_V1, PROMPT_V2, get_extraction_prompt
+    from app.services.extractor import extract_pdf_text_for_pages, extract_document
+    from app.services.storage import get_document_dir, save_original
+
+    # (a) Plain text vs Table-aware PDF text on synthetic table PDF
+    doc = pymupdf.open()
+    page = doc.new_page(width=300, height=300)
+    page.insert_text(pymupdf.Point(40, 30), "Invoice Header")
+    shape = page.new_shape()
+    shape.draw_line(pymupdf.Point(40, 50), pymupdf.Point(240, 50))
+    shape.draw_line(pymupdf.Point(40, 80), pymupdf.Point(240, 80))
+    shape.draw_line(pymupdf.Point(40, 110), pymupdf.Point(240, 110))
+    shape.draw_line(pymupdf.Point(40, 50), pymupdf.Point(40, 110))
+    shape.draw_line(pymupdf.Point(140, 50), pymupdf.Point(140, 110))
+    shape.draw_line(pymupdf.Point(240, 50), pymupdf.Point(240, 110))
+    shape.finish()
+    shape.commit()
+    page.insert_text(pymupdf.Point(50, 70), "ColA")
+    page.insert_text(pymupdf.Point(150, 70), "ColB")
+    page.insert_text(pymupdf.Point(50, 100), "ValA")
+    page.insert_text(pymupdf.Point(150, 100), "10.00")
+    pdf_bytes = doc.tobytes()
+    doc.close()
+
+    tbl_dir = tmp_path / "table_doc"
+    tbl_dir.mkdir(parents=True)
+    (tbl_dir / "original.pdf").write_bytes(pdf_bytes)
+
+    text_v1 = extract_pdf_text_for_pages(tbl_dir, [1], version="v1")
+    text_v2 = extract_pdf_text_for_pages(tbl_dir, [1], version="v2")
+    # v1 has plain text without pipe separators
+    assert "|" not in text_v1
+    assert "ColA" in text_v1
+    # v2 has pipe-separated table rows
+    assert "|" in text_v2
+
+    # (b) Multi-invoice detection and page re-selection
+    # 3-page synthetic PDF with 2 invoices: pages 1 & 2 = INV-001, page 3 = INV-002
+    multi_doc = pymupdf.open()
+    p1 = multi_doc.new_page()
+    p1.insert_text((50, 50), "Invoice No: INV-001\nLine items on page 1")
+    p2 = multi_doc.new_page()
+    p2.insert_text((50, 50), "Line items continued on page 2")
+    p3 = multi_doc.new_page()
+    p3.insert_text((50, 50), "Invoice No: INV-002\nDifferent invoice page 3")
+    multi_bytes = multi_doc.tobytes()
+    multi_doc.close()
+
+    doc_id = str(uuid.uuid4())
+    save_original(doc_id, multi_bytes, "application/pdf")
+    m_dir = get_document_dir(doc_id)
+    # Create fake page images
+    (m_dir / "page_1.png").write_bytes(b"fake1")
+    (m_dir / "page_2.png").write_bytes(b"fake2")
+    (m_dir / "page_3.png").write_bytes(b"fake3")
+
+    fake_inv = InvoiceData(vendor="Test Vendor", invoice_number="INV-001", date="2026-11-05", total=100.0)
+    fake_meta = ExtractionMeta(model="mock", latency_ms=10, input_tokens=10, output_tokens=10, pages_sent=[])
+
+    with patch("app.services.extractor.get_extractor") as mock_get_ext:
+        mock_ext = mock_get_ext.return_value
+        mock_ext.extract.return_value = (fake_inv, fake_meta)
+
+        # v1: no multi-invoice detection, selects first and last page [1, 3]
+        _, meta_v1 = extract_document(doc_id, version="v1")
+        assert meta_v1.pages_sent == [1, 3]
+        assert "invoice_number" not in meta_v1.extra_flags
+
+        # v2: multi-invoice detection groups pages 1-2 (INV-001, 2 pages) vs page 3 (INV-002, 1 page)
+        # Selects group with most pages -> [1, 2] and adds MULTIPLE_INVOICES_SUSPECTED
+        _, meta_v2 = extract_document(doc_id, version="v2")
+        assert meta_v2.pages_sent == [1, 2]
+        assert "invoice_number" in meta_v2.extra_flags
+        assert meta_v2.extra_flags["invoice_number"]["code"] == "MULTIPLE_INVOICES_SUSPECTED"
+
+    # (c) GST-slab skip in ITEM_MATH_MISMATCH
+    inv_gst = InvoiceData(
+        vendor="GST Vendor",
+        invoice_number="INV-GST",
+        date="2026-11-05",
+        total=118.0,
+        subtotal=100.0,
+        line_items=[LineItem(description="Item 18%", quantity=1.0, unit_price=100.0, amount=118.0)],
+    )
+    # v1: strict math check, flags ITEM_MATH_MISMATCH
+    flags_c_v1 = run_checks(inv_gst, version="v1")
+    assert "line_items[0].amount" in flags_c_v1
+    assert flags_c_v1["line_items[0].amount"]["code"] == "ITEM_MATH_MISMATCH"
+
+    # v2: GST slab ratio (1.18 within 0.02 of 1.18) is skipped
+    flags_c_v2 = run_checks(inv_gst, version="v2")
+    assert "line_items[0].amount" not in flags_c_v2
+
+    # (d) FIELD_NOT_IN_TEXT check
+    inv_ungrounded = InvoiceData(
+        vendor="Acme Corporation Never In Text",
+        invoice_number="INV-999",
+        date="2026-11-05",
+        total=100.0,
+        subtotal=100.0,
+    )
+    text_content = "Invoice No: INV-999\nDate: 2026-11-05\nTotal: 100.00"
+    # v1: no text-grounding check -> no FIELD_NOT_IN_TEXT flag
+    flags_d_v1 = run_checks(inv_ungrounded, text_content=text_content, source="text", version="v1")
+    assert "vendor" not in flags_d_v1
+
+    # v2: text grounding enabled -> warns FIELD_NOT_IN_TEXT
+    flags_d_v2 = run_checks(inv_ungrounded, text_content=text_content, source="text", version="v2")
+    assert "vendor" in flags_d_v2
+    assert flags_d_v2["vendor"]["code"] == "FIELD_NOT_IN_TEXT"
+
+    # (e) PROMPT_V1 vs PROMPT_V2
+    # v1: returns PROMPT_V1 matching baseline sha256
+    prompt_v1 = get_extraction_prompt("v1")
+    assert prompt_v1 == PROMPT_V1
+    assert hashlib.sha256(prompt_v1.encode("utf-8")).hexdigest() == "1d06ec7147f6489dd80ac79f877fa0a9892ac98e743b848be54c761a2e1dd31f"
+    # v2: returns PROMPT_V2 with vendor and amount rules
+    prompt_v2 = get_extraction_prompt("v2")
+    assert prompt_v2 == PROMPT_V2
+    assert "amount = the line total printed in the right-most amount column" in prompt_v2
+    assert "vendor = the legal name of the company that issues the invoice (the seller)" in prompt_v2
+
+
+def test_manifest_and_raw_result_features_recording(tmp_path, monkeypatch):
+    """Manifest and raw result files record pipeline_version and features string."""
+    from evaluation.pipeline_runner import write_manifest, run_pipeline_on_file
+
+    eval_dir = tmp_path / "eval"
+    monkeypatch.setenv("EVAL_DIR", str(eval_dir))
+
+    # Manifest recording
+    mf_v1_path = write_manifest(["c1"], label="v1_test", version="v1")
+    mf_v1 = json.loads(mf_v1_path.read_text(encoding="utf-8"))
+    assert mf_v1["pipeline_version"] == "v1"
+    assert mf_v1["features"] == "v1:baseline"
+
+    mf_v2_path = write_manifest(["c1"], label="v2_test", version="v2")
+    mf_v2 = json.loads(mf_v2_path.read_text(encoding="utf-8"))
+    assert mf_v2["pipeline_version"] == "v2"
+    assert mf_v2["features"] == "v2:table_text,multi_inv,tax_item,text_ground,prompt_v2"
+
+    # Raw result recording
+    # Missing file produces error result, but still has pipeline_version and features recorded
+    res_v1 = run_pipeline_on_file(tmp_path / "nonexistent.pdf", version="v1")
+    dict_v1 = res_v1.to_dict()
+    assert dict_v1["pipeline_version"] == "v1"
+    assert dict_v1["features"] == "v1:baseline"
+
+    res_v2 = run_pipeline_on_file(tmp_path / "nonexistent.pdf", version="v2")
+    dict_v2 = res_v2.to_dict()
+    assert dict_v2["pipeline_version"] == "v2"
+    assert dict_v2["features"] == "v2:table_text,multi_inv,tax_item,text_ground,prompt_v2"
+
+
+
+
 
 
 

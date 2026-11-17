@@ -61,6 +61,7 @@ class ExtractionMeta(BaseModel):
     pages_sent: list[int]
     repaired: bool = False
     source: str = "image"  # "text" or "image"
+    extra_flags: dict[str, Any] = Field(default_factory=dict)
 
 
 class PagePreview(BaseModel):

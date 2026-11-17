@@ -15,11 +15,11 @@ from typing import Any, Optional
 
 import pymupdf
 
-from app.config import settings
+from app.config import settings, features_for
 from app.errors import AppError
 from app.schemas import InvoiceData, ExtractionMeta
 from app.services.checks import run_checks
-from app.services.extractor import extract_document
+from app.services.extractor import extract_document, extract_pdf_text_for_pages
 from app.services.preprocessing import preprocess_document
 from app.services.storage import delete_document, get_document_dir, save_original
 from app.services.validation import detect_mime_type
@@ -43,10 +43,14 @@ class PipelineResult:
     needs_review: bool
     meta: Optional[ExtractionMeta]
     error: Optional[dict[str, str]]
+    pipeline_version: str = "v2"
+    features: str = "v2:table_text,multi_inv,tax_item,text_ground,prompt_v2"
 
     def to_dict(self) -> dict[str, Any]:
         """Convert result to JSON-serializable dictionary."""
         return {
+            "pipeline_version": self.pipeline_version,
+            "features": self.features,
             "extraction": self.extraction.model_dump() if self.extraction else None,
             "flags": self.flags,
             "needs_review": self.needs_review,
@@ -67,6 +71,8 @@ class PipelineResult:
             needs_review=data.get("needs_review", False),
             meta=meta,
             error=data.get("error"),
+            pipeline_version=data.get("pipeline_version", "v1"),
+            features=data.get("features", "v1:baseline"),
         )
 
 
@@ -102,15 +108,22 @@ def has_usable_text_layer(path: Path | str, min_chars: int = 50) -> bool:
         return False
 
 
-def run_pipeline_on_file(path: Path | str, mode: Optional[str] = None) -> PipelineResult:
+def run_pipeline_on_file(
+    path: Path | str,
+    mode: Optional[str] = None,
+    version: Optional[str] = None,
+) -> PipelineResult:
     """Execute preprocessing, extraction, and validation on a single document file.
 
     Does not write to SQLite DB; isolates working files in a temporary storage
     directory and removes all temporary files after completion.
     """
+    feat = features_for(version)
     file_path = Path(path)
     if not file_path.is_file():
         return PipelineResult(
+            pipeline_version=feat.version,
+            features=feat.short_string,
             extraction=None,
             flags={},
             needs_review=True,
@@ -129,13 +142,23 @@ def run_pipeline_on_file(path: Path | str, mode: Optional[str] = None) -> Pipeli
         preprocess_document(doc_dir, content, mime_type)
 
         # Run extraction with mode override (does NOT touch DB)
-        invoice_data, meta = extract_document(document_id, mode_override=mode)
+        invoice_data, meta = extract_document(document_id, mode_override=mode, version=feat.version)
 
         # Run validation checks
-        flags = run_checks(invoice_data)
+        pdf_text = extract_pdf_text_for_pages(doc_dir, meta.pages_sent if meta else [1], version=feat.version)
+        source = meta.source if meta else (mode or "image")
+        flags = run_checks(
+            invoice_data,
+            text_content=pdf_text,
+            source=source,
+            extra_flags=meta.extra_flags if meta else None,
+            version=feat.version,
+        )
         needs_review = bool(flags)
 
         return PipelineResult(
+            pipeline_version=feat.version,
+            features=feat.short_string,
             extraction=invoice_data,
             flags=flags,
             needs_review=needs_review,
@@ -146,6 +169,8 @@ def run_pipeline_on_file(path: Path | str, mode: Optional[str] = None) -> Pipeli
     except AppError as exc:
         logger.warning("Pipeline AppError on %s: [%s] %s", file_path.name, exc.code, exc.message)
         return PipelineResult(
+            pipeline_version=feat.version,
+            features=feat.short_string,
             extraction=None,
             flags={},
             needs_review=True,
@@ -155,6 +180,8 @@ def run_pipeline_on_file(path: Path | str, mode: Optional[str] = None) -> Pipeli
     except Exception as exc:
         logger.exception("Unexpected error in run_pipeline_on_file for %s", file_path.name)
         return PipelineResult(
+            pipeline_version=feat.version,
+            features=feat.short_string,
             extraction=None,
             flags={},
             needs_review=True,
@@ -222,38 +249,48 @@ def get_git_version_info() -> dict[str, Any]:
     return info
 
 
-def get_prompt_sha256() -> str:
-    """Retrieve SHA-256 hash of EXTRACTION_PROMPT."""
+def get_prompt_sha256(version: str | None = None) -> str:
+    """Retrieve SHA-256 hash of extraction prompt for version."""
     try:
-        from app.services.groq_extractor import EXTRACTION_PROMPT
-        return hashlib.sha256(EXTRACTION_PROMPT.encode("utf-8")).hexdigest()
+        from app.services.groq_extractor import get_extraction_prompt
+        prompt = get_extraction_prompt(version)
+        return hashlib.sha256(prompt.encode("utf-8")).hexdigest()
     except Exception:
         return "unknown"
 
 
-def build_case_matrix(only_doc: Optional[str] = None) -> list[EvalCase]:
-    """Build the case matrix for all documents in eval/data/."""
-    data_dir = get_data_dir()
-    gt_dir = get_gt_dir()
+def build_case_matrix(
+    only_doc: Optional[str] = None,
+    dataset: str = "dev",
+    cases_filter: Optional[list[str]] = None,
+) -> list[EvalCase]:
+    """Build the case matrix for documents in eval/data/ or eval/holdout/data/."""
+    data_dir = get_data_dir(dataset)
+    gt_dir = get_gt_dir(dataset)
     variants_dir = get_variants_dir()
 
-    data_files = sorted([p for p in data_dir.iterdir() if p.is_file() and p.name != ".gitkeep"])
+    data_files = (
+        sorted([p for p in data_dir.iterdir() if p.is_file() and p.name != ".gitkeep"])
+        if data_dir.exists()
+        else []
+    )
     cases: list[EvalCase] = []
 
     for doc_path in data_files:
         # Resolve doc_id
         doc_id = doc_path.stem
         # Check ground truth for explicit doc_id
-        for gt_path in gt_dir.glob("*.json"):
-            if gt_path.name == ".gitkeep":
-                continue
-            try:
-                gt_data = load_ground_truth(gt_path)
-                if gt_data.get("source_file") == doc_path.name:
-                    doc_id = gt_data.get("doc_id", doc_id)
-                    break
-            except Exception:
-                pass
+        if gt_dir.exists():
+            for gt_path in gt_dir.glob("*.json"):
+                if gt_path.name == ".gitkeep":
+                    continue
+                try:
+                    gt_data = load_ground_truth(gt_path)
+                    if gt_data.get("source_file") == doc_path.name:
+                        doc_id = gt_data.get("doc_id", doc_id)
+                        break
+                except Exception:
+                    pass
 
         if only_doc and (only_doc not in (doc_id, doc_path.name, doc_path.stem)):
             continue
@@ -285,48 +322,59 @@ def build_case_matrix(only_doc: Optional[str] = None) -> list[EvalCase]:
             )
         )
 
-        # 3. Degraded variants (lowres, jpeg35, rot3blur)
-        ext = ".pdf" if doc_path.suffix.lower() == ".pdf" else ".jpg"
-        for v in ("lowres", "jpeg35", "rot3blur"):
-            var_path = variants_dir / f"{doc_id}__{v}{ext}"
-            cases.append(
-                EvalCase(
-                    case_id=f"{doc_id}__{v}",
-                    doc_id=doc_id,
-                    source_file=doc_path.name,
-                    target_path=var_path,
-                    mode="auto",
-                    case_type=v,
-                    estimated_tokens=4000,
+        # 3. Degraded variants (only for dev set; holdout has only text & image)
+        if dataset != "holdout":
+            ext = ".pdf" if doc_path.suffix.lower() == ".pdf" else ".jpg"
+            for v in ("lowres", "jpeg35", "rot3blur"):
+                var_path = variants_dir / f"{doc_id}__{v}{ext}"
+                cases.append(
+                    EvalCase(
+                        case_id=f"{doc_id}__{v}",
+                        doc_id=doc_id,
+                        source_file=doc_path.name,
+                        target_path=var_path,
+                        mode="auto",
+                        case_type=v,
+                        estimated_tokens=4000,
+                    )
                 )
-            )
+
+    if cases_filter:
+        allowed = set(cases_filter)
+        cases = [c for c in cases if c.case_type in allowed]
 
     return cases
 
 
-def cmd_plan(only_doc: Optional[str] = None) -> int:
+def cmd_plan(
+    only_doc: Optional[str] = None,
+    dataset: str = "dev",
+    cases: Optional[str] = None,
+) -> int:
     """Print evaluation case matrix, token estimates, and runtime without API calls."""
-    cases = build_case_matrix(only_doc=only_doc)
-    if not cases:
-        print("No cases found in case matrix. Ensure documents are in eval/data/.")
+    cases_filter = [c.strip() for c in cases.split(",") if c.strip()] if cases else None
+    case_list = build_case_matrix(only_doc=only_doc, dataset=dataset, cases_filter=cases_filter)
+    if not case_list:
+        print(f"No cases found in case matrix. Ensure documents are in {get_data_dir(dataset)}.")
         return 0
 
-    total_tokens = sum(c.estimated_tokens for c in cases)
+    total_tokens = sum(c.estimated_tokens for c in case_list)
     # Estimate time: 8000 tokens/min limit + ~15s per-call pacing
-    total_minutes = (total_tokens / 8000.0) + (len(cases) * 15.0 / 60.0)
+    total_minutes = (total_tokens / 8000.0) + (len(case_list) * 15.0 / 60.0)
     daily_cap = int(os.getenv("EVAL_DAILY_TOKEN_CAP", 150000))
 
     print(f"=== Evaluation Plan & Case Matrix (Dry Run) ===")
-    print(f"Total Cases: {len(cases)} across {len(set(c.doc_id for c in cases))} document(s)\n")
+    print(f"Dataset: {dataset} | Cases Filter: {cases or 'all'}")
+    print(f"Total Cases: {len(case_list)} across {len(set(c.doc_id for c in case_list))} document(s)\n")
 
-    for idx, c in enumerate(cases, 1):
+    for idx, c in enumerate(case_list, 1):
         status_note = ""
         if not c.target_path.exists():
             status_note = " (file not yet generated: run 'cli variants')"
         print(f"  {idx:2d}. {c.case_id:<26} [mode={c.mode:<5}] ~{c.estimated_tokens:,} tokens{status_note}")
 
     print("\n--- Summary Estimates (Zero Real API Calls) ---")
-    print(f"  Total API Calls:     {len(cases)} calls (authorized budget: at most 45 calls)")
+    print(f"  Total API Calls:     {len(case_list)} calls")
     print(f"  Estimated Tokens:    {total_tokens:,} tokens")
     print(f"  Estimated Runtime:   ~{total_minutes:.1f} minutes (respecting 8K tokens/min rate & pacing)")
     print(f"  Daily Token Cap:     {daily_cap:,} tokens (env: EVAL_DAILY_TOKEN_CAP)")
@@ -334,9 +382,9 @@ def cmd_plan(only_doc: Optional[str] = None) -> int:
     return 0
 
 
-def load_daily_usage(date_str: str) -> dict[str, Any]:
+def load_daily_usage(date_str: str, label: str = "v1") -> dict[str, Any]:
     """Load or initialize usage data for a specific date."""
-    usage_file = get_results_dir() / "usage.json"
+    usage_file = get_results_dir(label) / "usage.json"
     if usage_file.is_file():
         try:
             all_usage = json.loads(usage_file.read_text(encoding="utf-8"))
@@ -346,9 +394,9 @@ def load_daily_usage(date_str: str) -> dict[str, Any]:
     return {"date": date_str, "total_tokens": 0, "total_calls": 0}
 
 
-def update_daily_usage(date_str: str, tokens: int, calls: int = 1) -> None:
-    """Record token and call count to eval/results/usage.json."""
-    results_dir = get_results_dir()
+def update_daily_usage(date_str: str, tokens: int, calls: int = 1, label: str = "v1") -> None:
+    """Record token and call count to eval/results/<label>/usage.json."""
+    results_dir = get_results_dir(label)
     results_dir.mkdir(parents=True, exist_ok=True)
     usage_file = results_dir / "usage.json"
 
@@ -368,12 +416,13 @@ def update_daily_usage(date_str: str, tokens: int, calls: int = 1) -> None:
         json.dump(all_usage, f, indent=2)
 
 
-def write_manifest(case_ids: list[str]) -> Path:
-    """Generate and write eval/results/manifest.json."""
-    results_dir = get_results_dir()
+def write_manifest(case_ids: list[str], label: str = "v1", version: str | None = None) -> Path:
+    """Generate and write eval/results/<label>/manifest.json."""
+    results_dir = get_results_dir(label)
     results_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = results_dir / "manifest.json"
 
+    feat = features_for(version)
     git_ver = get_git_version_info()
     manifest_data = {
         "date": datetime.now(timezone.utc).isoformat(),
@@ -382,7 +431,9 @@ def write_manifest(case_ids: list[str]) -> Path:
         "model": settings.groq_model,
         "seed": settings.groq_seed,
         "default_extraction_mode": settings.extraction_mode,
-        "prompt_sha256": get_prompt_sha256(),
+        "pipeline_version": feat.version,
+        "features": feat.short_string,
+        "prompt_sha256": get_prompt_sha256(feat.version),
         "python_version": sys.version.split()[0],
         "cases": case_ids,
     }
@@ -398,34 +449,40 @@ def cmd_run(
     only: Optional[str] = None,
     force: bool = False,
     repeats: int = 1,
+    dataset: str = "dev",
+    label: str = "v1",
+    cases: Optional[str] = None,
+    version: Optional[str] = None,
 ) -> int:
     """Execute evaluation run with rate-limit pacing and automatic resume."""
-    results_dir = get_results_dir()
+    feat = features_for(version)
+    results_dir = get_results_dir(label)
     raw_dir = results_dir / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
 
-    cases = build_case_matrix(only_doc=only)
-    if not cases:
+    cases_filter = [c.strip() for c in cases.split(",") if c.strip()] if cases else None
+    case_list = build_case_matrix(only_doc=only, dataset=dataset, cases_filter=cases_filter)
+    if not case_list:
         print("No cases to run.")
         return 0
 
-    write_manifest([c.case_id for c in cases])
+    write_manifest([c.case_id for c in case_list], label=label, version=feat.version)
 
     daily_cap = int(os.getenv("EVAL_DAILY_TOKEN_CAP", 150000))
     today_str = datetime.now().strftime("%Y-%m-%d")
-    usage = load_daily_usage(today_str)
+    usage = load_daily_usage(today_str, label=label)
 
     executed = 0
     consecutive_errors = 0
 
     print(f"=== Starting Evaluation Run ===")
-    print(f"Cases to evaluate: {len(cases)} (limit={limit}, force={force})")
+    print(f"Cases to evaluate: {len(case_list)} (limit={limit}, force={force}, label={label}, dataset={dataset})")
     print(f"Today's usage so far: {usage['total_tokens']:,} tokens across {usage['total_calls']} calls\n")
 
-    for case in cases:
+    for case in case_list:
         if limit is not None and executed >= limit:
             print(f"\n[LIMIT] Reached limit of {limit} cases for this run.")
-            print(f"Resume remaining cases with: python -m evaluation.cli run")
+            print(f"Resume remaining cases with: python -m evaluation.cli run --label {label} --dataset {dataset}")
             return 0
 
         case_out_file = raw_dir / f"{case.case_id}.json"
@@ -449,7 +506,7 @@ def cmd_run(
 
         print(f"  [RUN] {case.case_id} (mode={case.mode})...", end="", flush=True)
 
-        res = run_pipeline_on_file(case.target_path, mode=case.mode)
+        res = run_pipeline_on_file(case.target_path, mode=case.mode, version=feat.version)
 
         # Save result JSON
         with case_out_file.open("w", encoding="utf-8") as f:
@@ -470,14 +527,14 @@ def cmd_run(
         else:
             consecutive_errors = 0
             tokens_used = (res.meta.input_tokens + res.meta.output_tokens) if res.meta else case.estimated_tokens
-            update_daily_usage(today_str, tokens_used, calls=1)
+            update_daily_usage(today_str, tokens_used, calls=1, label=label)
             usage["total_tokens"] += tokens_used
             usage["total_calls"] += 1
             print(f" OK ({tokens_used:,} tokens, {res.meta.latency_ms if res.meta else 0}ms)")
 
             # Pacing sleep: max(10, total_tokens / 8000 * 60 + 5)
             pacing_seconds = max(10, int((tokens_used / 8000.0) * 60.0 + 5.0))
-            if executed < len(cases) and (limit is None or executed < limit):
+            if executed < len(case_list) and (limit is None or executed < limit):
                 print(f"    (Pacing: sleeping {pacing_seconds}s to respect Groq rate limits...)")
                 time.sleep(pacing_seconds)
 

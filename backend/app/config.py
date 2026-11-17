@@ -1,6 +1,7 @@
 """Configuration settings for AI Document-to-Data Extractor."""
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -23,6 +24,8 @@ class Settings(BaseModel):
     groq_seed: int = int(os.getenv("GROQ_SEED", "42"))
     extraction_max_pages: int = int(os.getenv("EXTRACTION_MAX_PAGES", "2"))
     extraction_mode: str = os.getenv("EXTRACTION_MODE", "auto")  # "auto", "text", "image"
+    pipeline_version: str = os.getenv("PIPELINE_VERSION", "v2")  # "v1", "v2"
+    gst_slab_multipliers: list[float] = [1.05, 1.12, 1.18, 1.28]
 
     # General app settings
     frontend_origin: str = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
@@ -61,3 +64,47 @@ class Settings(BaseModel):
 
 
 settings = Settings()
+
+
+@dataclass(frozen=True)
+class PipelineFeatures:
+    """Feature flags and configuration for a given pipeline version."""
+
+    version: str
+    table_aware_text: bool        # v1: False (page.get_text("text")), v2: True (sort=True + find_tables)
+    multi_invoice_detection: bool # v1: False (standard select_pages), v2: True (detect_multi_invoices + page re-selection)
+    tax_aware_item_math: bool     # v1: False (strict math check), v2: True (skip GST slab ratios)
+    text_grounding_check: bool    # v1: False (no FIELD_NOT_IN_TEXT), v2: True (FIELD_NOT_IN_TEXT check)
+    prompt_version: str           # v1: "v1" (PROMPT_V1), v2: "v2" (PROMPT_V2)
+
+    @property
+    def short_string(self) -> str:
+        """Compact feature summary for manifests and results."""
+        if self.version == "v1":
+            return "v1:baseline"
+        return "v2:table_text,multi_inv,tax_item,text_ground,prompt_v2"
+
+
+def features_for(version: str | None = None) -> PipelineFeatures:
+    """Return the feature flag bundle for a pipeline version ('v1' or 'v2').
+
+    Defaults to settings.pipeline_version (or env var PIPELINE_VERSION, default 'v2').
+    """
+    v = (version or getattr(settings, "pipeline_version", "v2")).lower().strip()
+    if v == "v1":
+        return PipelineFeatures(
+            version="v1",
+            table_aware_text=False,
+            multi_invoice_detection=False,
+            tax_aware_item_math=False,
+            text_grounding_check=False,
+            prompt_version="v1",
+        )
+    return PipelineFeatures(
+        version="v2",
+        table_aware_text=True,
+        multi_invoice_detection=True,
+        tax_aware_item_math=True,
+        text_grounding_check=True,
+        prompt_version="v2",
+    )

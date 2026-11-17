@@ -287,5 +287,5 @@ Root cause distribution across all 22 silent-error cases (from `eval/results/err
 ---
 
 ## 14. Definitions
-- **`critical_correct`**: Case where vendor name achieves a near-match (`vendor` similarity ratio >= 0.80), and both `date` and `total` are correct (`vendor near-match + date + total`).
+- **`critical_correct`**: Case where vendor name achieves a near-match (`vendor` similarity ratio >= 0.90), and both `date` and `total` are correct (`vendor near-match + date + total`).
 - **Critical-Field Defect (used in Section 12(c))**: Case with an error in any of the four critical fields: `vendor`, `invoice_number`, `date`, or `total` (`any of vendor, invoice_number, date, total wrong`).

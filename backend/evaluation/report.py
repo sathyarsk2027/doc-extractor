@@ -951,7 +951,7 @@ def generate_report_markdown(
         "---",
         "",
         "## 14. Definitions",
-        "- **`critical_correct`**: Case where vendor name achieves a near-match (`vendor` similarity ratio >= 0.80), and both `date` and `total` are correct (`vendor near-match + date + total`).",
+        "- **`critical_correct`**: Case where vendor name achieves a near-match (`vendor` similarity ratio >= 0.90), and both `date` and `total` are correct (`vendor near-match + date + total`).",
         "- **Critical-Field Defect (used in Section 12(c))**: Case with an error in any of the four critical fields: `vendor`, `invoice_number`, `date`, or `total` (`any of vendor, invoice_number, date, total wrong`).",
         "",
     ])
@@ -959,11 +959,11 @@ def generate_report_markdown(
     return "\n".join(lines)
 
 
-def cmd_report() -> int:
+def cmd_report(label: str = "v1", dataset: str = "dev") -> int:
     """Generate aggregate summary markdown report from scored results."""
-    results_dir = get_results_dir()
+    results_dir = get_results_dir(label)
     raw_dir = results_dir / "raw"
-    gt_dir = get_gt_dir()
+    gt_dir = get_gt_dir(dataset)
     report_dir = get_report_dir()
     report_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1121,9 +1121,282 @@ def cmd_report() -> int:
     report_git = get_report_git_info()
     markdown = generate_report_markdown(manifest, scored_cases, doc_kinds, causes_data=causes_data, report_git=report_git)
 
-    out_file = report_dir / "summary.md"
+    out_file = report_dir / "summary.md" if label == "v1" else report_dir / f"summary_{label}.md"
     out_file.write_text(markdown, encoding="utf-8")
     print(f"Report generated successfully: {out_file} ({len(scored_cases)} cases analyzed).")
+    return 0
+
+
+def cmd_compare(label_a: str = "v1", label_b: str = "v2", dataset: str = "dev") -> int:
+    """Compare evaluation results between two labels over common cases."""
+    from evaluation.ground_truth import get_results_dir, get_gt_dir, get_report_dir, load_ground_truth
+    from evaluation.scoring import score_case
+
+    dir_a = get_results_dir(label_a)
+    dir_b = get_results_dir(label_b)
+    raw_a = dir_a / "raw"
+    raw_b = dir_b / "raw"
+    gt_dir = get_gt_dir(dataset)
+    report_dir = get_report_dir()
+    report_dir.mkdir(parents=True, exist_ok=True)
+
+    if not raw_a.exists():
+        print(f"Error: Raw results directory for label '{label_a}' not found: {raw_a}")
+        return 1
+    if not raw_b.exists():
+        print(f"Error: Raw results directory for label '{label_b}' not found: {raw_b}")
+        return 1
+
+    files_a = {p.stem: p for p in raw_a.glob("*.json")}
+    files_b = {p.stem: p for p in raw_b.glob("*.json")}
+    common_case_ids = sorted(set(files_a.keys()) & set(files_b.keys()))
+
+    if not common_case_ids:
+        print(f"No common cases found between '{label_a}' and '{label_b}'.")
+        return 1
+
+    # Load ground truth for documents
+    doc_gts: dict[str, dict[str, Any]] = {}
+    if gt_dir.exists():
+        for p in gt_dir.glob("*.json"):
+            if p.name != ".gitkeep":
+                try:
+                    data = load_ground_truth(p)
+                    d_id = data.get("doc_id", p.stem)
+                    doc_gts[d_id] = data
+                except Exception:
+                    pass
+
+    # Read manifests if available
+    manifest_a: dict[str, Any] = {}
+    manifest_b: dict[str, Any] = {}
+    mf_a = dir_a / "manifest.json"
+    mf_b = dir_b / "manifest.json"
+    if mf_a.is_file():
+        try:
+            manifest_a = json.loads(mf_a.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    if mf_b.is_file():
+        try:
+            manifest_b = json.loads(mf_b.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    records = []
+    doc_errors_a: dict[str, int] = defaultdict(int)
+    doc_errors_b: dict[str, int] = defaultdict(int)
+
+    for cid in common_case_ids:
+        doc_id = cid.split("__")[0]
+        case_type = cid.split("__")[1] if "__" in cid else "unknown"
+        gt = doc_gts.get(doc_id, {})
+
+        data_a = json.loads(files_a[cid].read_text(encoding="utf-8"))
+        data_b = json.loads(files_b[cid].read_text(encoding="utf-8"))
+
+        pred_a = InvoiceData.model_validate(data_a.get("extraction")) if data_a.get("extraction") else None
+        pred_b = InvoiceData.model_validate(data_b.get("extraction")) if data_b.get("extraction") else None
+
+        score_a = score_case(
+            doc_id=doc_id,
+            case_id=cid,
+            ground_truth=gt,
+            prediction=pred_a,
+            flags=data_a.get("flags") or {},
+            needs_review=data_a.get("needs_review", False),
+        )
+        score_b = score_case(
+            doc_id=doc_id,
+            case_id=cid,
+            ground_truth=gt,
+            prediction=pred_b,
+            flags=data_b.get("flags") or {},
+            needs_review=data_b.get("needs_review", False),
+        )
+
+        meta_a = data_a.get("meta") or {}
+        meta_b = data_b.get("meta") or {}
+        tokens_a = meta_a.get("input_tokens", 0) + meta_a.get("output_tokens", 0)
+        tokens_b = meta_b.get("input_tokens", 0) + meta_b.get("output_tokens", 0)
+
+        err_a = len(score_a.wrong_fields)
+        err_b = len(score_b.wrong_fields)
+        doc_errors_a[doc_id] += err_a
+        doc_errors_b[doc_id] += err_b
+
+        records.append({
+            "case_id": cid,
+            "doc_id": doc_id,
+            "case_type": case_type,
+            "score_a": score_a,
+            "score_b": score_b,
+            "tokens_a": tokens_a,
+            "tokens_b": tokens_b,
+        })
+
+    # Build anonymous document map
+    sorted_doc_ids = sorted(set(r["doc_id"] for r in records))
+    doc_anon_map = {d: f"Document {string.ascii_uppercase[i]}" if i < 26 else f"Document {i+1}" for i, d in enumerate(sorted_doc_ids)}
+
+    # Document comparison: better / equal / worse
+    doc_better = 0  # B has fewer wrong headers than A
+    doc_equal = 0
+    doc_worse = 0   # B has more wrong headers than A
+
+    for doc_id in sorted_doc_ids:
+        ea = doc_errors_a[doc_id]
+        eb = doc_errors_b[doc_id]
+        if eb < ea:
+            doc_better += 1
+        elif eb > ea:
+            doc_worse += 1
+        else:
+            doc_equal += 1
+
+    p_sign = compute_sign_test_onesided_p(doc_better, doc_worse)
+
+    lines: list[str] = []
+    lines.append(f"# Pipeline Evaluation Comparison: {label_a} vs {label_b}\n")
+    lines.append(f"Comparison evaluated over **{len(records)} common cases** across **{len(sorted_doc_ids)} documents** on the `{dataset}` dataset.\n")
+
+    lines.append("> [!NOTE]")
+    lines.append(f"> The development dataset was used to identify weaknesses and design fixes in pipeline {label_b}; therefore, observed gains on this dataset are optimistic. An independent evaluation on an unseen holdout dataset is required to confirm generalizability.\n")
+
+    # Metadata table
+    lines.append("## 1. Run Metadata\n")
+    lines.append(f"| Setting | {label_a} | {label_b} |")
+    lines.append("|---|---|---|")
+    lines.append(f"| **Pipeline Version** | {manifest_a.get('pipeline_version', label_a)} | {manifest_b.get('pipeline_version', label_b)} |")
+    lines.append(f"| **Model** | {manifest_a.get('model', 'unknown')} | {manifest_b.get('model', 'unknown')} |")
+    lines.append(f"| **Prompt SHA-256** | `{manifest_a.get('prompt_sha256', 'unknown')[:12]}...` | `{manifest_b.get('prompt_sha256', 'unknown')[:12]}...` |")
+    lines.append(f"| **Common Evaluated Cases** | {len(records)} | {len(records)} |\n")
+
+    def _compute_metrics(subset: list[dict[str, Any]]):
+        n = len(subset)
+        if n == 0:
+            return {}, {}
+
+        def _stats(label_key: str, token_key: str):
+            crit_corr = sum(1 for r in subset if r[label_key].critical_correct)
+            all_corr = sum(1 for r in subset if r[label_key].all_header_correct)
+            wrong_fields = [len(r[label_key].wrong_fields) for r in subset]
+            mean_wrong = sum(wrong_fields) / n if n > 0 else 0.0
+
+            li_recalls = [r[label_key].line_item_result.recall for r in subset]
+            macro_recall = (sum(li_recalls) / n * 100.0) if n > 0 else 0.0
+
+            total_matched = sum(r[label_key].line_item_result.matched_count for r in subset)
+            total_expected = sum(r[label_key].line_item_result.expected_count for r in subset)
+            micro_recall = (total_matched / total_expected * 100.0) if total_expected > 0 else 100.0
+
+            fn_count = sum(1 for r in subset if r[label_key].classification == "FN")
+            tp_count = sum(1 for r in subset if r[label_key].classification == "TP")
+            fp_count = sum(1 for r in subset if r[label_key].classification == "FP")
+            val_recall = (tp_count / (tp_count + fn_count) * 100.0) if (tp_count + fn_count) > 0 else 100.0
+
+            mean_tokens = sum(r[token_key] for r in subset) / n if n > 0 else 0.0
+
+            return {
+                "critical_correct": (crit_corr, n, crit_corr / n * 100.0),
+                "all_header_correct": (all_corr, n, all_corr / n * 100.0),
+                "mean_wrong_fields": mean_wrong,
+                "macro_recall": macro_recall,
+                "micro_recall": micro_recall,
+                "silent_errors": fn_count,
+                "validator_recall": val_recall,
+                "false_alarms": fp_count,
+                "mean_tokens": mean_tokens,
+            }
+
+        return _stats("score_a", "tokens_a"), _stats("score_b", "tokens_b")
+
+    def _format_comparison_table(stats_a: dict[str, Any], stats_b: dict[str, Any]) -> list[str]:
+        t_lines = []
+        t_lines.append(f"| Metric | {label_a} | {label_b} | Delta ({label_b} - {label_a}) |")
+        t_lines.append("|---|---|---|---|")
+
+        ca, cb = stats_a["critical_correct"], stats_b["critical_correct"]
+        diff_crit = cb[2] - ca[2]
+        t_lines.append(f"| **Critical Correct Rate** | {ca[0]}/{ca[1]} ({ca[2]:.1f}%) | {cb[0]}/{cb[1]} ({cb[2]:.1f}%) | {diff_crit:+.1f}% |")
+
+        ha, hb = stats_a["all_header_correct"], stats_b["all_header_correct"]
+        diff_all = hb[2] - ha[2]
+        t_lines.append(f"| **All Headers Correct Rate** | {ha[0]}/{ha[1]} ({ha[2]:.1f}%) | {hb[0]}/{hb[1]} ({hb[2]:.1f}%) | {diff_all:+.1f}% |")
+
+        wa, wb = stats_a["mean_wrong_fields"], stats_b["mean_wrong_fields"]
+        diff_w = wb - wa
+        t_lines.append(f"| **Mean Wrong Headers / Case** | {wa:.2f} | {wb:.2f} | {diff_w:+.2f} |")
+
+        rma, rmb = stats_a["macro_recall"], stats_b["macro_recall"]
+        diff_rm = rmb - rma
+        t_lines.append(f"| **Line-Item Recall (macro)** | {rma:.1f}% | {rmb:.1f}% | {diff_rm:+.1f}% |")
+
+        ria, rib = stats_a["micro_recall"], stats_b["micro_recall"]
+        diff_ri = rib - ria
+        t_lines.append(f"| **Line-Item Recall (micro)** | {ria:.1f}% | {rib:.1f}% | {diff_ri:+.1f}% |")
+
+        fa, fb = stats_a["silent_errors"], stats_b["silent_errors"]
+        diff_f = fb - fa
+        t_lines.append(f"| **Silent Errors (FN)** | {fa} | {fb} | {diff_f:+d} |")
+
+        va, vb = stats_a["validator_recall"], stats_b["validator_recall"]
+        diff_v = vb - va
+        t_lines.append(f"| **Validator Recall** | {va:.1f}% | {vb:.1f}% | {diff_v:+.1f}% |")
+
+        pa, pb = stats_a["false_alarms"], stats_b["false_alarms"]
+        diff_p = pb - pa
+        t_lines.append(f"| **False Alarms (FP)** | {pa} | {pb} | {diff_p:+d} |")
+
+        ta, tb = stats_a["mean_tokens"], stats_b["mean_tokens"]
+        diff_t = tb - ta
+        t_lines.append(f"| **Mean Tokens / Case** | {ta:,.0f} | {tb:,.0f} | {diff_t:+,.0f} |")
+
+        return t_lines
+
+    # Overall Summary Table
+    lines.append("## 2. Overall Performance Comparison (Pooled Across Common Cases)\n")
+    all_a, all_b = _compute_metrics(records)
+    lines.extend(_format_comparison_table(all_a, all_b))
+    lines.append("")
+
+    # Per-case-type tables
+    case_types = sorted(set(r["case_type"] for r in records))
+    lines.append("## 3. Performance by Case Type\n")
+    for ct in case_types:
+        ct_records = [r for r in records if r["case_type"] == ct]
+        lines.append(f"### Case Type: `{ct}` ({len(ct_records)} cases)\n")
+        cta, ctb = _compute_metrics(ct_records)
+        lines.extend(_format_comparison_table(cta, ctb))
+        lines.append("")
+
+    # Per-Document Comparison & Sign Test
+    lines.append("## 4. Per-Document Comparison & Sign Test\n")
+    lines.append("Document-level comparison based on total wrong header fields across all shared cases:\n")
+    lines.append(f"| Document | {label_a} Wrong Headers | {label_b} Wrong Headers | Outcome |")
+    lines.append("|---|---|---|---|")
+    for doc_id in sorted_doc_ids:
+        ea = doc_errors_a[doc_id]
+        eb = doc_errors_b[doc_id]
+        anon_name = doc_anon_map[doc_id]
+        if eb < ea:
+            outcome = f"{label_b} Better (-{ea - eb})"
+        elif eb > ea:
+            outcome = f"{label_b} Worse (+{eb - ea})"
+        else:
+            outcome = "Equal (Tie)"
+        lines.append(f"| {anon_name} | {ea} | {eb} | {outcome} |")
+
+    lines.append("")
+    n_non_tied = doc_better + doc_worse
+    lines.append(f"- **{label_b} Better**: {doc_better} documents")
+    lines.append(f"- **Equal (Tie)**: {doc_equal} documents")
+    lines.append(f"- **{label_b} Worse**: {doc_worse} documents")
+    lines.append(f"- **Exact Sign Test**: p = {p_sign:.4f} (one-sided testing {label_b} better, N={n_non_tied} non-tied documents)\n")
+
+    out_file = report_dir / f"{label_a}_vs_{label_b}.md"
+    out_file.write_text("\n".join(lines), encoding="utf-8")
+    print(f"Comparison report generated: {out_file}")
     return 0
 
 

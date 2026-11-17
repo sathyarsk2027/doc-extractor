@@ -7,7 +7,7 @@ from fastapi import APIRouter, File, UploadFile
 from app.errors import AppError
 from app.schemas import DocumentDetail, PagePreview
 from app.services.validation import validate_upload
-from app.services.extractor import extract_document
+from app.services.extractor import extract_document, extract_pdf_text_for_pages
 from app.services.checks import run_checks
 from app.services.documents import save_extracted_document
 from app.services.storage import (
@@ -99,7 +99,14 @@ def extract_endpoint(file: UploadFile = File(...)) -> DocumentDetail:
     try:
         invoice_data, meta = extract_document(document_id)
         # Run validation checks on extracted structured data
-        flags = run_checks(invoice_data)
+        pdf_text = extract_pdf_text_for_pages(doc_dir, meta.pages_sent if meta else [1])
+        source = meta.source if meta else "image"
+        flags = run_checks(
+            invoice_data,
+            text_content=pdf_text,
+            source=source,
+            extra_flags=meta.extra_flags if meta else None,
+        )
         needs_review = bool(flags)
     except AppError as exc:
         logger.warning("Extraction failed for %s: [%s] %s", document_id, exc.code, exc.message)

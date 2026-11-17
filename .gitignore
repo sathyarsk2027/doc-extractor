@@ -39,6 +39,10 @@ eval/data/*
 !eval/data/.gitkeep
 eval/ground_truth/*
 !eval/ground_truth/.gitkeep
+eval/holdout/data/*
+!eval/holdout/data/.gitkeep
+eval/holdout/ground_truth/*
+!eval/holdout/ground_truth/.gitkeep
 eval/variants/
 !eval/variants/
 eval/variants/*
@@ -50,4 +54,5 @@ eval/results/*
 eval/report/*
 !eval/report/.gitkeep
 !eval/report/summary.md
+!eval/report/*.md
 eval/timing.csv
